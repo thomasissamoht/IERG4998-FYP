@@ -12,6 +12,12 @@ from typing import Optional
 from bib import BibliographyManager
 import importlib
 from typing import TYPE_CHECKING, Any
+import tempfile
+import zipfile
+import shutil
+import os
+from tkinter import filedialog
+from tkinter import messagebox
 
 if TYPE_CHECKING:
     # Provide a name for static checkers without importing the runtime module
@@ -39,9 +45,18 @@ class ModernBibGUI:
         self._syncing_scroll_x = False
         self._current_changed_lines = []
         self._current_changed_idx = -1
+        self._last_master_path = None
+        self._last_cleaned_zip = None
         
         # Build UI
         self._build_ui()
+
+    def _ui_call(self, func, *args, **kwargs):
+        """Run UI operation on main thread (Tkinter-safe)."""
+        if threading.current_thread() is threading.main_thread():
+            func(*args, **kwargs)
+        else:
+            self.root.after(0, lambda: func(*args, **kwargs))
         
     def _build_ui(self):
         """Build the user interface"""
@@ -81,7 +96,7 @@ class ModernBibGUI:
         dir_label = ctk.CTkLabel(sidebar, text="Select Directory", font=ctk.CTkFont(size=14, weight="bold"))
         dir_label.grid(row=2, column=0, padx=20, pady=(10, 5), sticky="w")
         
-        self.dir_entry = ctk.CTkEntry(sidebar, placeholder_text="Choose directory with .bib files...")
+        self.dir_entry = ctk.CTkEntry(sidebar, placeholder_text="Choose folder or .zip with .bib files...")
         self.dir_entry.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
         
         self.browse_btn = ctk.CTkButton(
@@ -340,6 +355,38 @@ class ModernBibGUI:
         )
         self.next_change_btn.grid(row=0, column=1, padx=(0, 8), sticky="w")
 
+        # Visual legend badges for demo clarity
+        legend_frame = ctk.CTkFrame(nav_frame, fg_color="transparent")
+        legend_frame.grid(row=0, column=2, sticky="e")
+
+        self.legend_orig = ctk.CTkLabel(
+            legend_frame,
+            text=" 🟨 Original Change ",
+            fg_color="#ffe08a",
+            text_color="#111111",
+            corner_radius=6,
+            font=ctk.CTkFont(size=11)
+        )
+        self.legend_orig.grid(row=0, column=0, padx=(0, 6))
+
+        self.legend_fixed = ctk.CTkLabel(
+            legend_frame,
+            text=" 🟩 Fixed Change ",
+            fg_color="#b6f2c7",
+            text_color="#111111",
+            corner_radius=6,
+            font=ctk.CTkFont(size=11)
+        )
+        self.legend_fixed.grid(row=0, column=1, padx=(0, 6))
+
+        self.legend_marker = ctk.CTkLabel(
+            legend_frame,
+            text="🔎 >> changed line",
+            text_color="gray",
+            font=ctk.CTkFont(size=11)
+        )
+        self.legend_marker.grid(row=0, column=2)
+
         # Info label for changed lines
         self.changed_info = ctk.CTkLabel(tab, text="", text_color="gray")
         self.changed_info.grid(row=1, column=0, columnspan=2, sticky="e", padx=20, pady=(0,6))
@@ -557,9 +604,25 @@ class ModernBibGUI:
         • Author name matching (30% weight)
         • Year bonus (+10%)
         
-        Citation Key Format:
-        firstname-year-keyword
-        (e.g., smith-2023-advances)
+                Citation Key Normalization:
+                The manager regenerates keys into a consistent, informative format:
+                firstauthor[-secondauthor]-year-titleword1[-titleword2]
+
+                Examples:
+                • smith-2023-advances-ai
+                • chen-zhang-2021-machine-learning
+
+                Rules:
+                • Uses up to first 2 author surnames
+                • Uses a 4-digit year when available
+                • Uses up to first 2 meaningful title words
+                • Ensures uniqueness with suffixes when needed
+                    (e.g., smith-2023-advances-ai-a)
+
+                Why it helps:
+                • Keys become predictable and readable
+                • Easier to cite and search across files
+                • Better consistency after merging bibliographies
         
         ══════════════════════════════════════════
         Final Year Project 2026
@@ -579,8 +642,19 @@ class ModernBibGUI:
         self.threshold_label.configure(text=f"{int(value)}%")
         
     def _browse_directory(self):
-        """Open directory browser"""
-        directory = ctk.filedialog.askdirectory(title="Select Directory with .bib files")
+        """Open browser for ZIP file or directory."""
+        # First let user pick a ZIP file quickly.
+        zip_path = filedialog.askopenfilename(
+            title="Select Overleaf ZIP (or cancel to pick a folder)",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+        )
+        if zip_path:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, zip_path)
+            return
+
+        # Fallback to folder selection.
+        directory = filedialog.askdirectory(title="Select Directory with .bib files")
         if directory:
             self.dir_entry.delete(0, "end")
             self.dir_entry.insert(0, directory)
@@ -591,9 +665,36 @@ class ModernBibGUI:
         
     def _log_message(self, message: str, color: str = "white"):
         """Add message to log"""
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.root.update_idletasks()
+        def _write():
+            self.log_text.insert("end", message + "\n")
+            self.log_text.see("end")
+            self.root.update_idletasks()
+
+        self._ui_call(_write)
+
+    def _build_output_paths_text(self) -> str:
+        """Build a human-readable block of output paths."""
+        lines = []
+        if self._last_master_path:
+            lines.append(f"Master bibliography:\n{self._last_master_path}\n")
+        if self._last_cleaned_zip:
+            lines.append(f"Cleaned ZIP:\n{self._last_cleaned_zip}\n")
+        if self.report_path:
+            lines.append(f"Report:\n{self.report_path}\n")
+        return "\n".join(lines).strip()
+
+    def _copy_output_paths_to_clipboard(self):
+        """Copy latest output paths to system clipboard."""
+        text = self._build_output_paths_text()
+        if not text:
+            return False
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()  # keep clipboard after app closes
+            return True
+        except Exception:
+            return False
         
     def _run_pipeline(self):
         """Run the bibliography management pipeline"""
@@ -611,7 +712,9 @@ class ModernBibGUI:
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
         self.duplicates_text.delete("1.0", "end")
-        self.progress.set(0)
+        self._ui_call(self.progress.set, 0)
+        self.report_path = None
+        self._ui_call(self.view_report_btn.configure, state="disabled")
         
         # Disable run button
         self.run_btn.configure(state="disabled")
@@ -624,25 +727,43 @@ class ModernBibGUI:
         
     def _pipeline_worker(self):
         """Worker thread for pipeline execution"""
+        temp_dir_obj = None
+        zip_mode = False
+        zip_input_path = None
+        cleaned_zip = None
         try:
             directory = self.dir_entry.get().strip()
             threshold = self.threshold_var.get()
             push_back = self.push_var.get()
             generate_report = self.report_var.get()
+
+            input_path = Path(directory)
+            working_directory = directory
+
+            # ZIP mode: extract first, process extracted folder, then re-zip.
+            if input_path.is_file() and input_path.suffix.lower() == ".zip":
+                zip_mode = True
+                zip_input_path = input_path
+                self._log_message("\n📦 ZIP mode detected. Extracting archive...")
+                temp_dir_obj = tempfile.TemporaryDirectory()
+                with zipfile.ZipFile(str(input_path), 'r') as zf:
+                    zf.extractall(temp_dir_obj.name)
+                working_directory = temp_dir_obj.name
+                self._log_message(f"✓ Extracted ZIP to temp workspace: {working_directory}")
             
             self._log_message("="*60)
             self._log_message("🚀 Starting Bibliography Processing Pipeline")
             self._log_message("="*60)
             
             # Initialize manager
-            self.manager = BibliographyManager(directory)
-            self.progress.set(0.1)
+            self.manager = BibliographyManager(working_directory)
+            self._ui_call(self.progress.set, 0.1)
             
             # Step 1: Crawl
             self._log_message("\n📁 Step 1/4: Crawling for .bib files...")
             num_files, num_entries = self.manager.crawl_and_collect()
             self._log_message(f"✓ Found {num_files} files with {num_entries} entries")
-            self.progress.set(0.3)
+            self._ui_call(self.progress.set, 0.3)
             
             if num_entries == 0:
                 self._log_message("\n⚠️ No entries found!")
@@ -652,13 +773,13 @@ class ModernBibGUI:
             self._log_message(f"\n🔍 Step 2/4: Finding duplicates (threshold: {threshold}%)...")
             num_groups = self.manager.find_duplicates(threshold=float(threshold))
             self._log_message(f"✓ Found {num_groups} duplicate groups")
-            self.progress.set(0.5)
+            self._ui_call(self.progress.set, 0.5)
             
             # Step 3: Remove duplicates
             self._log_message("\n🗑️ Step 3/4: Removing duplicates...")
             self.manager.remove_duplicates()
             self._log_message(f"✓ Removed {self.manager.report_data['duplicates_removed']} duplicates")
-            self.progress.set(0.7)
+            self._ui_call(self.progress.set, 0.7)
             
             # Step 4: Fix keys
             self._log_message("\n🔑 Step 4/4: Normalizing citation keys...")
@@ -669,7 +790,8 @@ class ModernBibGUI:
             self._log_message("\n💾 Creating master bibliography...")
             master_path = self.manager.create_master_bibliography()
             self._log_message(f"✓ Created: {master_path}")
-            self.progress.set(0.85)
+            self._last_master_path = str(master_path)
+            self._ui_call(self.progress.set, 0.85)
             
             # Push back if requested
             if push_back:
@@ -683,7 +805,34 @@ class ModernBibGUI:
                 self._log_message("\n📊 Generating HTML report...")
                 self.report_path = self.manager.generate_html_report()
                 self._log_message(f"✓ Report: {self.report_path}")
-                self.view_report_btn.configure(state="normal")
+                self._ui_call(self.view_report_btn.configure, state="normal")
+
+            # If input was ZIP, package processed files into a new ZIP and copy report outside temp dir.
+            if zip_mode and zip_input_path is not None:
+                cleaned_zip = zip_input_path.with_name(f"{zip_input_path.stem}_cleaned.zip")
+                with zipfile.ZipFile(str(cleaned_zip), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                    for root, _, files in os.walk(working_directory):
+                        for name in files:
+                            file_path = Path(root) / name
+                            arcname = str(file_path.relative_to(working_directory))
+                            zf.write(str(file_path), arcname)
+                self._log_message(f"✓ Cleaned ZIP created: {cleaned_zip}")
+                self._last_cleaned_zip = str(cleaned_zip)
+
+                # Copy report to same folder as source ZIP so it persists after temp cleanup.
+                if self.report_path and Path(self.report_path).exists():
+                    report_src = Path(self.report_path)
+                    report_dest = zip_input_path.with_name(f"{zip_input_path.stem}_{report_src.name}")
+                    shutil.copy2(str(report_src), str(report_dest))
+                    self.report_path = str(report_dest)
+                    self._log_message(f"✓ Report copied next to ZIP: {report_dest}")
+
+            # Final report availability check (after possible ZIP copy)
+            if self.report_path and Path(self.report_path).exists():
+                self._ui_call(self.view_report_btn.configure, state="normal")
+            else:
+                self._ui_call(self.view_report_btn.configure, state="disabled")
+                self._log_message("⚠️ Report file not found at final path; View Report disabled.")
 
             # Populate fixes tab if file changes recorded
             file_changes = self.manager.report_data.get('file_changes', {})
@@ -700,15 +849,32 @@ class ModernBibGUI:
                 except Exception:
                     pass
             
-            self.progress.set(1.0)
+            self._ui_call(self.progress.set, 1.0)
             
             # Update results
-            self._update_results()
-            self._update_duplicates()
+            self._ui_call(self._update_results)
+            self._ui_call(self._update_duplicates)
             
             self._log_message("\n" + "="*60)
             self._log_message("✨ Pipeline completed successfully!")
             self._log_message("="*60)
+
+            # Show completion popup with output locations (on UI thread)
+            def _show_done_popup():
+                outputs = self._build_output_paths_text()
+                if outputs:
+                    msg = "Pipeline completed successfully!\n\n" + outputs + "\n\nCopy these paths to clipboard?"
+                    copy_now = messagebox.askyesno("BibTeX Manager", msg)
+                    if copy_now:
+                        ok = self._copy_output_paths_to_clipboard()
+                        if ok:
+                            messagebox.showinfo("BibTeX Manager", "Output paths copied to clipboard.")
+                        else:
+                            messagebox.showwarning("BibTeX Manager", "Could not copy to clipboard.")
+                else:
+                    messagebox.showinfo("BibTeX Manager", "Pipeline completed successfully!")
+
+            self._ui_call(_show_done_popup)
             
         except Exception as e:
             self._log_message(f"\n❌ Error: {str(e)}")
@@ -716,9 +882,14 @@ class ModernBibGUI:
             self._log_message(traceback.format_exc())
             
         finally:
+            if temp_dir_obj is not None:
+                try:
+                    temp_dir_obj.cleanup()
+                except Exception:
+                    pass
             self.processing = False
-            self.run_btn.configure(state="normal")
-            self.cancel_btn.configure(state="disabled")
+            self._ui_call(self.run_btn.configure, state="normal")
+            self._ui_call(self.cancel_btn.configure, state="disabled")
             
     def _cancel_pipeline(self):
         """Cancel pipeline execution"""

@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated reports and demo artifacts
+*_report_*.html
+*_cleaned.zip
+report_*.html
+
+# Local build/packaging outputs
+bibtex-manager-portable.zip
+bibtex-manager-updated.zip
+
+# Virtual environment
+venv/

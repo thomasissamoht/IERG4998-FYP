@@ -367,32 +367,38 @@ class BibliographyManager:
         print(f"✓ Final count: {len(self.all_entries)} unique entries\n")
     
     def generate_citation_key(self, entry: Dict, existing_keys: Set[str]) -> str:
-        """Generate a consistent citation key for an entry
-        
-        Format: firstauthor-year-titleword
-        
+        """Generate a consistent, informative citation key for an entry.
+
+        Format: firstauthor[-secondauthor]-year-titleword1[-titleword2]
+        Example: smith-doe-2020-deep-vision
+
         Args:
             entry: Bibliography entry
             existing_keys: Set of already used keys (to ensure uniqueness)
-            
+
         Returns:
             Generated citation key
         """
-        # Extract first author's last name
+        # Extract up to first two author surnames
         authors = self.extract_authors_lastname(entry.get('author', ''))
-        if authors:
-            author_part = re.sub(r'[^a-z0-9]', '', authors[0].lower())
+        clean_authors = [re.sub(r'[^a-z0-9]', '', a.lower()) for a in authors if a]
+        if clean_authors:
+            author_part = "-".join(clean_authors[:2])
         else:
             author_part = 'unknown'
-        
-        # Extract year
-        year = entry.get('year', '0000')
-        
-        # Extract first meaningful word from title
+
+        # Extract 4-digit year if available
+        year_raw = str(entry.get('year', '0000'))
+        year_match = re.search(r'\d{4}', year_raw)
+        year = year_match.group(0) if year_match else '0000'
+
+        # Extract up to first two meaningful title words
         title = self.normalize_string(entry.get('title', ''))
         title_words = [w for w in title.split() if len(w) > 3]
-        title_part = title_words[0] if title_words else 'paper'
-        
+        if not title_words:
+            title_words = ['paper']
+        title_part = "-".join(title_words[:2])
+
         # Construct base key
         base_key = f"{author_part}-{year}-{title_part}"
         
@@ -550,14 +556,6 @@ class BibliographyManager:
             directory: Path to directory containing .bib files to update
             mapping: Dict of old_key -> new_key
         """
-        # Import here to avoid top-level dependency issues
-        try:
-            from bibtexparser.bparser import BibTexParser
-            import bibtexparser
-            from bibtexparser.bwriter import BibTexWriter
-        except Exception:
-            return
-
         # Prepare file_changes mapping for report
         file_changes: Dict[str, Dict] = self.report_data.get('file_changes', {})
 
@@ -567,28 +565,30 @@ class BibliographyManager:
                 with open(bib_file, encoding='utf-8') as f:
                     original_text = f.read()
 
-                # Parse and modify entries
-                parser = BibTexParser(common_strings=True)
-                db = bibtexparser.loads(original_text, parser=parser)
+                # Replace only citation keys on entry header lines, preserving formatting.
+                changed_lines: List[int] = []
 
-                updated = False
-                for entry in db.entries:
-                    old_id = entry.get('ID')
-                    if old_id in mapping:
-                        entry['ID'] = mapping[old_id]
-                        updated = True
+                def _replace_header_key(match):
+                    old_key = match.group(2).strip()
+                    if old_key in mapping:
+                        return f"{match.group(1)}{mapping[old_key]}{match.group(3)}"
+                    return match.group(0)
+
+                updated_text = original_text
+                updated_text = re.sub(
+                    r'(^\s*@\w+\s*\{\s*)([^,\s]+)(\s*,)',
+                    _replace_header_key,
+                    updated_text,
+                    flags=re.MULTILINE,
+                )
+
+                updated = updated_text != original_text
 
                 if updated:
-                    # Write updated bib file to string
-                    writer = BibTexWriter()
-                    writer.indent = '  '
-                    updated_text = writer.write(db)
-
                     # Compute changed lines (1-based)
                     orig_lines = original_text.splitlines()
                     upd_lines = updated_text.splitlines()
                     max_lines = max(len(orig_lines), len(upd_lines))
-                    changed_lines = []
                     for i in range(max_lines):
                         o = orig_lines[i] if i < len(orig_lines) else ''
                         u = upd_lines[i] if i < len(upd_lines) else ''
