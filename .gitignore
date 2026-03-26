@@ -10,6 +10,14 @@ report_*.html
 # Local build/packaging outputs
 bibtex-manager-portable.zip
 bibtex-manager-updated.zip
+*.zip
+*.dmg
+*.exe
+*.msi
+build/
+dist/
+installer/output/
+*.spec
 
 # Virtual environment
 venv/

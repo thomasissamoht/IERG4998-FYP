@@ -11,6 +11,46 @@
 
 ## ⚡ Quick Setup (5 minutes)
 
+## 📦 Build macOS Installer (.dmg)
+
+Use this section when you are the maintainer and want a distributable package
+for clean Mac users (no Python setup on user machine).
+
+### One command build
+```bash
+cd <project-folder>
+chmod +x installer/build_mac_setup.sh
+./installer/build_mac_setup.sh
+```
+
+Output files:
+- `installer/output/BibTeXManager-mac-<version>.dmg` (preferred)
+- `installer/output/BibTeXManager-mac-<version>.zip` (fallback)
+
+### Build automatically on GitHub (no local Mac required)
+
+This project includes `.github/workflows/build-macos.yml`.
+After you push to `master` or `main`, GitHub Actions will:
+1. Start a macOS runner
+2. Run `installer/build_mac_setup.sh`
+3. Upload `.dmg` and `.zip` as workflow artifacts
+
+To download the built files:
+1. Open your repository on GitHub
+2. Go to **Actions**
+3. Open the latest **Build macOS Installer** run
+4. Download the **macos-installer** artifact
+
+### End-user install on clean Mac
+1. Download `BibTeXManager-mac-<version>.dmg`
+2. Open DMG and drag `BibTeX Manager.app` to Applications
+3. Launch from Applications
+
+If Gatekeeper blocks first launch:
+- Right-click app → Open, or
+- System Settings → Privacy & Security → Open Anyway
+
+
 ### Step 1: Install Xcode Command Line Tools (First time only)
 ```bash
 xcode-select --install
