@@ -30,6 +30,14 @@ ctk.set_default_color_theme("blue")  # Themes: "blue" (default), "green", "dark-
 
 class ModernBibGUI:
     """Modern GUI for Bibliography Manager using CustomTkinter"""
+
+    def _on_citekey_rule_changed(self, rule):
+        # Only update entry if it exists
+        if hasattr(self, 'citekey_custom_entry'):
+            if rule == "custom":
+                self.citekey_custom_entry.configure(state="normal")
+            else:
+                self.citekey_custom_entry.configure(state="disabled")
     
     def __init__(self):
         """Initialize the modern GUI"""
@@ -47,7 +55,29 @@ class ModernBibGUI:
         self._current_changed_idx = -1
         self._last_master_path = None
         self._last_cleaned_zip = None
+        self._status_text = ctk.StringVar(value="Ready")
+        self._log_count = 0
+        self._log_buffer = []
+        self._log_flush_job = None
+        self._defer_log_render = False
+        self._deferred_logs = []
+        self._log_lock = threading.Lock()
+        self._step_state = {}
+        self._pending_step_text = "Waiting to start..."
+        self._pending_step_color = "#d1d5db"
+        self._pending_duplicates_refresh = False
+        self._duplicate_groups_cache = []
+        self._selected_duplicate_group = 0
+        self._duplicate_file_order = []
+        self._selected_duplicate_file = 0
+        self._duplicate_highlight_positions = []
+        self._selected_duplicate_highlight = 0
+        self._current_duplicate_display_name = "-"
         
+        # Citation key normalization rule (default and custom)
+        self.citekey_rule_var = ctk.StringVar(value="author-year-title")
+        self.citekey_custom_var = ctk.StringVar(value="{author}-{year}-{title}")
+
         # Build UI
         self._build_ui()
 
@@ -56,6 +86,7 @@ class ModernBibGUI:
         if threading.current_thread() is threading.main_thread():
             func(*args, **kwargs)
         else:
+            # Queue to main thread with proper argument passing
             self.root.after(0, lambda: func(*args, **kwargs))
         
     def _build_ui(self):
@@ -71,6 +102,12 @@ class ModernBibGUI:
         self._build_main_content()
         
     def _build_sidebar(self):
+    # Citation key normalization rule (default and custom)
+
+                        # Citation key normalization rule
+
+                # Citation key normalization rule
+
         """Build left sidebar with controls"""
         sidebar = ctk.CTkFrame(self.root, width=300, corner_radius=0)
         sidebar.grid(row=0, column=0, rowspan=4, sticky="nsew")
@@ -107,6 +144,30 @@ class ModernBibGUI:
             hover_color="gray30"
         )
         self.browse_btn.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
+
+        quick_actions = ctk.CTkFrame(sidebar, fg_color="transparent")
+        quick_actions.grid(row=5, column=0, padx=20, pady=(0, 8), sticky="ew")
+        quick_actions.grid_columnconfigure((0, 1), weight=1)
+
+        self.demo_btn = ctk.CTkButton(
+            quick_actions,
+            text="🧪 Use test_data",
+            command=self._use_test_data,
+            height=28,
+            fg_color="gray25",
+            hover_color="gray30"
+        )
+        self.demo_btn.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.clear_btn = ctk.CTkButton(
+            quick_actions,
+            text="🧹 Clear",
+            command=self._clear_for_next_run,
+            height=28,
+            fg_color="gray25",
+            hover_color="gray30"
+        )
+        self.clear_btn.grid(row=0, column=1, padx=(5, 0), sticky="ew")
         
         # Similarity threshold slider
         threshold_label = ctk.CTkLabel(
@@ -114,11 +175,19 @@ class ModernBibGUI:
             text="Similarity Threshold",
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        threshold_label.grid(row=5, column=0, padx=20, pady=(10, 5), sticky="w")
+        threshold_label.grid(row=6, column=0, padx=20, pady=(10, 5), sticky="w")
         
         self.threshold_var = ctk.IntVar(value=85)
         self.threshold_label = ctk.CTkLabel(sidebar, text="85%", text_color="#3b8ed0")
-        self.threshold_label.grid(row=6, column=0, padx=20, pady=0)
+        self.threshold_label.grid(row=7, column=0, padx=20, pady=0)
+        
+        self.threshold_hint = ctk.CTkLabel(
+            sidebar,
+            text="Balanced (recommended)",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.threshold_hint.grid(row=8, column=0, padx=20, pady=(0, 4))
         
         self.threshold_slider = ctk.CTkSlider(
             sidebar,
@@ -127,9 +196,8 @@ class ModernBibGUI:
             variable=self.threshold_var,
             command=self._update_threshold_label
         )
-        self.threshold_slider.grid(row=7, column=0, padx=20, pady=(5, 20), sticky="ew")
+        self.threshold_slider.grid(row=9, column=0, padx=20, pady=(5, 20), sticky="ew")
         
-        # Options
         self.push_var = ctk.BooleanVar(value=True)
         self.push_check = ctk.CTkCheckBox(
             sidebar,
@@ -137,7 +205,7 @@ class ModernBibGUI:
             variable=self.push_var,
             font=ctk.CTkFont(size=13)
         )
-        self.push_check.grid(row=8, column=0, padx=20, pady=5, sticky="w")
+        self.push_check.grid(row=10, column=0, padx=20, pady=5, sticky="w")
         
         self.report_var = ctk.BooleanVar(value=True)
         self.report_check = ctk.CTkCheckBox(
@@ -146,7 +214,15 @@ class ModernBibGUI:
             variable=self.report_var,
             font=ctk.CTkFont(size=13)
         )
-        self.report_check.grid(row=9, column=0, padx=20, pady=5, sticky="w")
+        self.report_check.grid(row=11, column=0, padx=20, pady=5, sticky="w")
+
+        self.status_label = ctk.CTkLabel(
+            sidebar,
+            textvariable=self._status_text,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#3b8ed0"
+        )
+        self.status_label.grid(row=12, column=0, padx=20, pady=(6, 0), sticky="w")
         
         # Action buttons
         self.run_btn = ctk.CTkButton(
@@ -158,7 +234,7 @@ class ModernBibGUI:
             fg_color="#1f538d",
             hover_color="#14375e"
         )
-        self.run_btn.grid(row=10, column=0, padx=20, pady=(30, 10), sticky="ew")
+        self.run_btn.grid(row=13, column=0, padx=20, pady=(30, 10), sticky="ew")
         
         self.cancel_btn = ctk.CTkButton(
             sidebar,
@@ -169,7 +245,7 @@ class ModernBibGUI:
             hover_color="gray30",
             state="disabled"
         )
-        self.cancel_btn.grid(row=11, column=0, padx=20, pady=5, sticky="ew")
+        self.cancel_btn.grid(row=14, column=0, padx=20, pady=5, sticky="ew")
         
         self.view_report_btn = ctk.CTkButton(
             sidebar,
@@ -180,12 +256,45 @@ class ModernBibGUI:
             hover_color="gray30",
             state="disabled"
         )
-        self.view_report_btn.grid(row=12, column=0, padx=20, pady=5, sticky="ew")
+        self.view_report_btn.grid(row=15, column=0, padx=20, pady=5, sticky="ew")
         
-        # Appearance mode switch
+        # Citation key normalization rule UI
+        rule_label = ctk.CTkLabel(sidebar, text="Citation Key Rule", font=ctk.CTkFont(size=14, weight="bold"))
+        rule_label.grid(row=17, column=0, padx=20, pady=(18, 5), sticky="w")
+
+        self.citekey_rule_menu = ctk.CTkOptionMenu(
+            sidebar,
+            values=["author-year-title", "author-year-titleword", "author-title", "professor-style", "professor-strict", "author-et-al-year", "lastname-only-year", "firstauthor-year-titleword", "compact-initials", "numeric", "custom"],
+            variable=self.citekey_rule_var,
+            command=self._on_citekey_rule_changed,
+            fg_color="gray25",
+            button_color="gray30",
+        )
+        self.citekey_rule_menu.grid(row=18, column=0, padx=20, pady=(0, 4), sticky="ew")
+        self.citekey_rule_menu.set("author-year-title")
+
+        self.citekey_custom_entry = ctk.CTkEntry(
+            sidebar,
+            textvariable=self.citekey_custom_var,
+            placeholder_text="e.g. {author}-{year}-{title}",
+            state="disabled"
+        )
+        self.citekey_custom_entry.grid(row=19, column=0, padx=20, pady=(0, 8), sticky="ew")
+
+        citekey_hint = ctk.CTkLabel(
+            sidebar,
+            text="Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {authorinitials}, {year}, {titleword}, {numeric}",
+            wraplength=220,
+            justify="left",
+            text_color="gray70",
+            font=ctk.CTkFont(size=11)
+        )
+        citekey_hint.grid(row=20, column=0, padx=20, pady=(0, 8), sticky="w")
+
+        # Appearance mode switch (move to bottom)
         appearance_label = ctk.CTkLabel(sidebar, text="Appearance Mode", font=ctk.CTkFont(size=12))
-        appearance_label.grid(row=13, column=0, padx=20, pady=(30, 5))
-        
+        appearance_label.grid(row=21, column=0, padx=20, pady=(22, 5))
+
         self.appearance_menu = ctk.CTkOptionMenu(
             sidebar,
             values=["System", "Light", "Dark"],
@@ -193,7 +302,7 @@ class ModernBibGUI:
             fg_color="gray25",
             button_color="gray30"
         )
-        self.appearance_menu.grid(row=14, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.appearance_menu.grid(row=22, column=0, padx=20, pady=(0, 20), sticky="ew")
         self.appearance_menu.set("Dark")
         
     def _build_main_content(self):
@@ -220,62 +329,212 @@ class ModernBibGUI:
         self._build_duplicates_tab()
         self._build_fixes_tab()
         self._build_about_tab()
+
+        # Refresh heavy tabs only when user opens them.
+        try:
+            self.tabview._segmented_button.configure(command=self._on_tab_changed)
+        except Exception:
+            pass
+
+    def _on_tab_changed(self, tab_name: str):
+        """Handle tab switch events for lazy heavy rendering."""
+        # Preserve default tab behavior; overriding segmented button command
+        # requires explicitly switching tabs.
+        self.tabview.set(tab_name)
+
+        # Defer heavy render slightly so the tab switch paints first.
+        if tab_name == "🔍 Duplicates" and self._pending_duplicates_refresh:
+            self.root.after(20, self._refresh_pending_duplicates)
+
+    def _refresh_pending_duplicates(self):
+        """Render duplicates only when needed and only on the Duplicates tab."""
+        if not self._pending_duplicates_refresh:
+            return
+        if self.tabview.get() != "🔍 Duplicates":
+            return
+
+        self._update_duplicates()
+        self._pending_duplicates_refresh = False
         
     def _build_pipeline_tab(self):
-        """Build pipeline execution tab"""
+        """Build pipeline execution tab with step cards"""
         tab = self.tabview.tab("📋 Pipeline")
-        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
         tab.grid_columnconfigure(0, weight=1)
         
-        # Progress textbox
+        # Steps timeline section
+        steps_section = ctk.CTkFrame(tab, fg_color="transparent")
+        steps_section.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        steps_section.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        
+        # Define pipeline steps with emojis
+        self.step_cards = {}
+        self.step_timers = {}
+        step_info = [
+            ('Crawl', '📁', 'Scanning .bib files'),
+            ('Duplicates', '🔍', 'Finding duplicates'),
+            ('Remove', '🗑️', 'Removing duplicates'),
+            ('Keys', '🔑', 'Normalizing keys')
+        ]
+        
+        for idx, (step_name, emoji, description) in enumerate(step_info):
+            # Step card
+            card = ctk.CTkFrame(steps_section, fg_color="transparent", corner_radius=0,
+                                border_width=1, border_color="#2a2a2a")
+            card.grid(row=0, column=idx, padx=4, pady=3, sticky="ew")
+            card.grid_columnconfigure(0, weight=1)
+            
+            # Emoji + Number
+            header = ctk.CTkFrame(card, fg_color="transparent")
+            header.pack(fill="x", padx=8, pady=(8, 2))
+            header.grid_columnconfigure(1, weight=1)
+            
+            step_num = ctk.CTkLabel(header, text=f"{emoji} Step {idx+1}",
+                                   font=ctk.CTkFont(size=10, weight="bold"))
+            step_num.grid(row=0, column=0, sticky="w")
+            
+            status_badge = ctk.CTkLabel(header, text="⌚ Pending",
+                                       font=ctk.CTkFont(size=8),
+                                       fg_color="transparent", text_color="#9ca3af",
+                                       padx=6, pady=2)
+            status_badge.grid(row=0, column=1, sticky="e")
+            
+            # Step name
+            name_label = ctk.CTkLabel(card, text=step_name,
+                                     font=ctk.CTkFont(size=11, weight="bold"))
+            name_label.pack(fill="x", padx=8, pady=(1, 1))
+            
+            # Description (single-line and subtle)
+            desc_label = ctk.CTkLabel(card, text=description,
+                                     font=ctk.CTkFont(size=8),
+                                     text_color="#7a7a7a")
+            desc_label.pack(fill="x", padx=8, pady=(0, 1))
+            
+            # Timer
+            timer_label = ctk.CTkLabel(card, text="0.0s",
+                                      font=ctk.CTkFont(size=9, weight="bold"),
+                                      text_color="#fbbf24")
+            timer_label.pack(fill="x", padx=8, pady=(1, 8))
+            
+            self.step_cards[step_name] = {
+                'card': card,
+                'status': status_badge,
+                'timer': timer_label,
+                'start_time': None
+            }
+            self.step_timers[step_name] = 0.0
+        
+        # Compact current step strip
+        step_strip = ctk.CTkFrame(tab, fg_color="#141414", corner_radius=6)
+        step_strip.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+        step_strip.grid_columnconfigure(1, weight=1)
+
+        detail_label = ctk.CTkLabel(step_strip, text="Current:",
+                       font=ctk.CTkFont(size=10, weight="bold"),
+                       text_color="#9ca3af")
+        detail_label.grid(row=0, column=0, sticky="w", padx=(10, 6), pady=6)
+
+        self.current_step_label = ctk.CTkLabel(step_strip,
+                              text="Waiting to start...",
+                              font=ctk.CTkFont(size=10),
+                              text_color="#d1d5db",
+                              anchor="w")
+        self.current_step_label.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        # Keep a reference to style the strip during state changes.
+        self.step_strip = step_strip
+        
+        # Log textbox with better formatting (minimal height initially)
+        log_label = ctk.CTkLabel(tab, text="📋 Pipeline Log",
+                                font=ctk.CTkFont(size=11, weight="bold"))
+        log_label.grid(row=2, column=0, sticky="w", padx=10, pady=(6, 4))
+        
         self.log_text = ctk.CTkTextbox(
             tab,
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=ctk.CTkFont(family="Consolas", size=10),
             wrap="word"
         )
-        self.log_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        
-        # Progress bar
-        self.progress = ctk.CTkProgressBar(tab)
-        self.progress.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-        self.progress.set(0)
+        self.log_text.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        tab.grid_rowconfigure(3, weight=1)
         
     def _build_results_tab(self):
-        """Build results summary tab"""
+        """Build results summary tab with visual metrics"""
         tab = self.tabview.tab("📊 Results")
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
         
-        # Stats frame
-        stats_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        stats_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        # Main stats in a scrollable frame
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        scroll.grid_columnconfigure((0, 1), weight=1)
         
-        # Create stat cards in grid
+        # Create enhanced stat cards in grid (2 columns)
         stats = [
-            ("📁 Files", "files"),
-            ("📝 Initial", "initial"),
-            ("🔄 Groups", "groups"),
-            ("🗑️ Removed", "removed"),
-            ("✅ Final", "final"),
-            ("⚡ Time", "time")
+            ("📁 Files", "files", "Total .bib files scanned"),
+            ("📝 Initial Entries", "initial", "Starting bibliography size"),
+            ("🔄 Duplicate Groups", "groups", "Number of duplicate clusters"),
+            ("🗑️ Entries Removed", "removed", "Duplicate entries deleted"),
+            ("✅ Final Entries", "final", "Cleaned bibliography size"),
+            ("⚡ Processing Time", "time", "Total runtime")
         ]
         
         self.stat_labels = {}
-        for idx, (label, key) in enumerate(stats):
-            row = idx // 3
-            col = idx % 3
+        self.stat_bars = {}  # For progress bars
+        
+        for idx, (label, key, description) in enumerate(stats):
+            row = idx // 2
+            col = idx % 2
             
-            card = ctk.CTkFrame(stats_frame)
-            card.grid(row=row, column=col, padx=10, pady=10, sticky="ew")
-            stats_frame.grid_columnconfigure(col, weight=1)
+            card = ctk.CTkFrame(scroll, fg_color="#1a1a1a", corner_radius=8)
+            card.grid(row=row, column=col, padx=8, pady=8, sticky="ew")
+            card.grid_columnconfigure(0, weight=1)
             
-            title = ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=12), text_color="gray")
-            title.pack(pady=(10, 5))
+            # Title and value row
+            header_frame = ctk.CTkFrame(card, fg_color="transparent")
+            header_frame.pack(fill="x", padx=12, pady=(12, 6))
+            header_frame.grid_columnconfigure(0, weight=1)
             
-            value = ctk.CTkLabel(card, text="—", font=ctk.CTkFont(size=32, weight="bold"))
-            value.pack(pady=(0, 10))
+            title = ctk.CTkLabel(header_frame, text=label, font=ctk.CTkFont(size=12, weight="bold"))
+            title.grid(row=0, column=0, sticky="w")
+            
+            value = ctk.CTkLabel(header_frame, text="—", font=ctk.CTkFont(size=20, weight="bold"), text_color="#4ade80")
+            value.grid(row=0, column=1, sticky="e")
             
             self.stat_labels[key] = value
+            
+            # Description
+            desc = ctk.CTkLabel(card, text=description, font=ctk.CTkFont(size=10), text_color="#888888")
+            desc.pack(fill="x", padx=12, pady=(0, 8))
+        
+        # Key metrics display
+        metrics_frame = ctk.CTkFrame(scroll, fg_color="#1a1a1a", corner_radius=8)
+        metrics_frame.grid(row=3, column=0, columnspan=2, padx=8, pady=8, sticky="ew")
+        metrics_frame.grid_columnconfigure(0, weight=1)
+        
+        metrics_title = ctk.CTkLabel(metrics_frame, text="📊 Key Metrics", font=ctk.CTkFont(size=12, weight="bold"))
+        metrics_title.pack(fill="x", padx=12, pady=(12, 8))
+        
+        # Reduction rate bar
+        rate_label = ctk.CTkLabel(metrics_frame, text="Reduction Rate", font=ctk.CTkFont(size=10))
+        rate_label.pack(fill="x", padx=12)
+        
+        self.reduction_bar = ctk.CTkProgressBar(metrics_frame)
+        self.reduction_bar.pack(fill="x", padx=12, pady=(4, 2))
+        self.reduction_bar.set(0)
+        
+        self.reduction_text = ctk.CTkLabel(metrics_frame, text="0%", font=ctk.CTkFont(size=10, weight="bold"), text_color="#fbbf24")
+        self.reduction_text.pack(fill="x", padx=12, pady=(0, 2))
+        
+        # Normalized keys indicator
+        keys_label = ctk.CTkLabel(metrics_frame, text="Citation Keys Normalized", font=ctk.CTkFont(size=10))
+        keys_label.pack(fill="x", padx=12, pady=(8, 2))
+        
+        self.keys_bar = ctk.CTkProgressBar(metrics_frame)
+        self.keys_bar.pack(fill="x", padx=12, pady=(4, 2))
+        self.keys_bar.set(0)
+        
+        self.keys_text = ctk.CTkLabel(metrics_frame, text="0 keys", font=ctk.CTkFont(size=10, weight="bold"), text_color="#60a5fa")
+        self.keys_text.pack(fill="x", padx=12, pady=(0, 12))
         
         # Details textbox
         self.results_text = ctk.CTkTextbox(tab, font=ctk.CTkFont(size=12))
@@ -296,8 +555,9 @@ class ModernBibGUI:
         left_frame.grid_rowconfigure(1, weight=1)
         left_frame.grid_columnconfigure(0, weight=1)
 
-        self.fix_file_menu = ctk.CTkOptionMenu(left_frame, values=[], command=self._show_file_fix)
+        self.fix_file_menu = ctk.CTkOptionMenu(left_frame, values=["No changed files yet"], command=self._show_file_fix)
         self.fix_file_menu.grid(row=0, column=0, padx=10, pady=(10,5), sticky="ew")
+        self.fix_file_menu.set("No changed files yet")
 
         self.orig_text = ctk.CTkTextbox(
             left_frame,
@@ -355,9 +615,19 @@ class ModernBibGUI:
         )
         self.next_change_btn.grid(row=0, column=1, padx=(0, 8), sticky="w")
 
+        self.normalize_keys_btn = ctk.CTkButton(
+            nav_frame,
+            text="Normalize All Keys",
+            width=160,
+            height=30,
+            command=self._run_pipeline,
+            state="normal"
+        )
+        self.normalize_keys_btn.grid(row=0, column=2, padx=(0, 8), sticky="w")
+
         # Visual legend badges for demo clarity
         legend_frame = ctk.CTkFrame(nav_frame, fg_color="transparent")
-        legend_frame.grid(row=0, column=2, sticky="e")
+        legend_frame.grid(row=0, column=3, sticky="e")
 
         self.legend_orig = ctk.CTkLabel(
             legend_frame,
@@ -561,14 +831,133 @@ class ModernBibGUI:
             return 'break'
         
     def _build_duplicates_tab(self):
-        """Build duplicates visualization tab"""
+        """Build duplicates tab with a lightweight, readable group viewer and summary/raw toggle."""
         tab = self.tabview.tab("🔍 Duplicates")
-        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(5, weight=1)
         tab.grid_columnconfigure(0, weight=1)
-        
-        self.duplicates_text = ctk.CTkTextbox(tab, font=ctk.CTkFont(size=12))
-        self.duplicates_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        
+
+        title = ctk.CTkLabel(
+            tab,
+            text="Duplicate Groups",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#9ca3af",
+        )
+        title.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+
+        controls = ctk.CTkFrame(tab, fg_color="transparent")
+        controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        controls.grid_columnconfigure(1, weight=1)
+
+        self.dup_prev_btn = ctk.CTkButton(
+            controls,
+            text="◀ Prev",
+            width=70,
+            command=self._show_prev_duplicate_group,
+            fg_color="gray25",
+            hover_color="gray30",
+        )
+        self.dup_prev_btn.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="w")
+
+        self.dup_group_menu = ctk.CTkOptionMenu(
+            controls,
+            values=["No groups"],
+            command=self._on_duplicate_group_selected,
+            fg_color="gray25",
+            button_color="gray30",
+        )
+        self.dup_group_menu.grid(row=0, column=1, padx=0, pady=0, sticky="ew")
+        self.dup_group_menu.set("No groups")
+
+        self.dup_next_btn = ctk.CTkButton(
+            controls,
+            text="Next ▶",
+            width=70,
+            command=self._show_next_duplicate_group,
+            fg_color="gray25",
+            hover_color="gray30",
+        )
+        self.dup_next_btn.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="e")
+
+        self.dup_summary_label = ctk.CTkLabel(
+            controls,
+            text="Run pipeline, then open this tab.",
+            font=ctk.CTkFont(size=10),
+            text_color="#6b7280",
+            anchor="w",
+        )
+        self.dup_summary_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+
+        file_controls = ctk.CTkFrame(tab, fg_color="transparent")
+        file_controls.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        file_controls.grid_columnconfigure(1, weight=1)
+
+        self.dup_file_prev_btn = ctk.CTkButton(
+            file_controls,
+            text="◀ File",
+            width=70,
+            command=self._show_prev_duplicate_file,
+            fg_color="gray25",
+            hover_color="gray30",
+        )
+        self.dup_file_prev_btn.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="w")
+
+        self.dup_file_menu = ctk.CTkOptionMenu(
+            file_controls,
+            values=["No files"],
+            command=self._on_duplicate_file_selected,
+            fg_color="gray25",
+            button_color="gray30",
+        )
+        self.dup_file_menu.grid(row=0, column=1, padx=0, pady=0, sticky="ew")
+        self.dup_file_menu.set("No files")
+
+        self.dup_file_next_btn = ctk.CTkButton(
+            file_controls,
+            text="File ▶",
+            width=70,
+            command=self._show_next_duplicate_file,
+            fg_color="gray25",
+            hover_color="gray30",
+        )
+        self.dup_file_next_btn.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="e")
+
+        self.dup_file_label = ctk.CTkLabel(
+            tab,
+            text="File: -",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#9ca3af",
+            anchor="w",
+        )
+        self.dup_file_label.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 4))
+
+        self.dup_decision_panel = ctk.CTkFrame(tab, fg_color="transparent")
+        self.dup_decision_panel.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self.dup_decision_panel.grid_columnconfigure((0, 1), weight=1)
+
+        self.dup_keep_box = ctk.CTkTextbox(
+            self.dup_decision_panel,
+            height=92,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wrap="word",
+        )
+        self.dup_keep_box.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.dup_drop_box = ctk.CTkTextbox(
+            self.dup_decision_panel,
+            height=92,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wrap="word",
+        )
+        self.dup_drop_box.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self.duplicates_text = ctk.CTkTextbox(
+            tab,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wrap="none",
+        )
+        self.duplicates_text.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.duplicates_text.insert("1.0", "Run pipeline, then open this tab to view duplicates.\n")
+
     def _build_about_tab(self):
         """Build about/help tab"""
         tab = self.tabview.tab("ℹ️ About")
@@ -639,7 +1028,43 @@ class ModernBibGUI:
         
     def _update_threshold_label(self, value):
         """Update threshold label when slider moves"""
-        self.threshold_label.configure(text=f"{int(value)}%")
+        score = int(value)
+        self.threshold_label.configure(text=f"{score}%")
+        if score < 70:
+            hint = "Aggressive (more duplicates flagged)"
+        elif score < 90:
+            hint = "Balanced (recommended)"
+        else:
+            hint = "Strict (fewer false positives)"
+        self.threshold_hint.configure(text=hint)
+
+    def _set_status(self, text: str, color: str = "#3b8ed0"):
+        """Update sidebar status text and color."""
+        self._ui_call(self._status_text.set, text)
+        self._ui_call(self.status_label.configure, text_color=color)
+
+    def _use_test_data(self):
+        """Quick-fill test_data directory for demos."""
+        candidate = Path(self.root.winfo_toplevel().tk.call('pwd')) / "test_data"
+        if candidate.exists():
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, str(candidate))
+            self._log_message(f"ℹ️ Using demo folder: {candidate}")
+        else:
+            self._log_message("⚠️ test_data folder not found in current project")
+
+    def _clear_for_next_run(self):
+        """Clear logs/results quickly for a fresh demo run."""
+        self.log_text.delete("1.0", "end")
+        self.results_text.delete("1.0", "end")
+        self.orig_text.delete("1.0", "end")
+        self.updated_text.delete("1.0", "end")
+        self.changed_info.configure(text="")
+        self._current_changed_lines = []
+        self._current_changed_idx = -1
+        self.prev_change_btn.configure(state="disabled")
+        self.next_change_btn.configure(state="disabled")
+        self._set_status("Ready", "#3b8ed0")
         
     def _browse_directory(self):
         """Open browser for ZIP file or directory."""
@@ -664,13 +1089,56 @@ class ModernBibGUI:
         ctk.set_appearance_mode(mode.lower())
         
     def _log_message(self, message: str, color: str = "white"):
-        """Add message to log"""
-        def _write():
-            self.log_text.insert("end", message + "\n")
-            self.log_text.see("end")
-            self.root.update_idletasks()
+        """Queue log messages and flush in small batches to reduce UI redraws."""
+        if self._defer_log_render:
+            with self._log_lock:
+                self._deferred_logs.append(message)
+            return
 
-        self._ui_call(_write)
+        def _enqueue():
+            self._log_buffer.append(message)
+            if self._log_flush_job is None:
+                # Batch frequent updates into one render pass.
+                self._log_flush_job = self.root.after(80, self._flush_log_buffer)
+
+        self._ui_call(_enqueue)
+
+    def _flush_log_buffer(self):
+        """Flush queued log messages on the UI thread."""
+        self._log_flush_job = None
+        if not self._log_buffer:
+            return
+
+        chunk = "\n".join(self._log_buffer) + "\n"
+        self._log_buffer.clear()
+        self.log_text.insert("end", chunk)
+
+        # Keep log size manageable - keep only last 150 lines to prevent slowdown
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        while line_count > 150:
+            self.log_text.delete("1.0", "2.0")
+            line_count -= 1
+
+        self.log_text.see("end")
+
+    def _flush_deferred_logs(self):
+        """Flush all deferred pipeline logs at once to avoid live repaint flashing."""
+        with self._log_lock:
+            if not self._deferred_logs:
+                return
+            pending = list(self._deferred_logs)
+            self._deferred_logs.clear()
+
+        def _write_bulk():
+            chunk = "\n".join(pending) + "\n"
+            self.log_text.insert("end", chunk)
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            while line_count > 300:
+                self.log_text.delete("1.0", "2.0")
+                line_count -= 1
+            self.log_text.see("end")
+
+        self._ui_call(_write_bulk)
 
     def _build_output_paths_text(self) -> str:
         """Build a human-readable block of output paths."""
@@ -711,8 +1179,6 @@ class ModernBibGUI:
         # Clear previous results
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
-        self.duplicates_text.delete("1.0", "end")
-        self._ui_call(self.progress.set, 0)
         self.report_path = None
         self._ui_call(self.view_report_btn.configure, state="disabled")
         
@@ -720,22 +1186,46 @@ class ModernBibGUI:
         self.run_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.processing = True
+        self._set_status("Running...", "#f59e0b")
+
+        # Minimize live UI churn while processing.
+        self._defer_log_render = True
+        with self._log_lock:
+            self._deferred_logs.clear()
+
+        # Capture UI-dependent options before entering worker thread.
+        options = {
+            'directory': directory,
+            'threshold': float(self.threshold_var.get()),
+            'push_back': bool(self.push_var.get()),
+            'generate_report': bool(self.report_var.get()),
+        }
         
         # Run in thread
-        thread = threading.Thread(target=self._pipeline_worker, daemon=True)
+        thread = threading.Thread(target=self._pipeline_worker, args=(options,), daemon=True)
         thread.start()
         
-    def _pipeline_worker(self):
+    def _pipeline_worker(self, options: dict[str, Any]):
         """Worker thread for pipeline execution"""
         temp_dir_obj = None
         zip_mode = False
         zip_input_path = None
         cleaned_zip = None
         try:
-            directory = self.dir_entry.get().strip()
-            threshold = self.threshold_var.get()
-            push_back = self.push_var.get()
-            generate_report = self.report_var.get()
+            # Reset step states and timers for fresh run
+            for step_name in self.step_cards:
+                self.step_timers[step_name] = 0.0
+                self._step_state[step_name] = "pending"
+                card_data = self.step_cards[step_name]
+                card_data['start_time'] = None
+            self._pending_step_text = "Initializing pipeline..."
+            self._pending_step_color = "#d1d5db"
+            self._ui_call(self._apply_pipeline_snapshot)
+            
+            directory = options['directory']
+            threshold = options['threshold']
+            push_back = options['push_back']
+            generate_report = options['generate_report']
 
             input_path = Path(directory)
             working_directory = directory
@@ -744,12 +1234,12 @@ class ModernBibGUI:
             if input_path.is_file() and input_path.suffix.lower() == ".zip":
                 zip_mode = True
                 zip_input_path = input_path
-                self._log_message("\n📦 ZIP mode detected. Extracting archive...")
+                self._log_message("📦 ZIP mode: Extracting archive...")
                 temp_dir_obj = tempfile.TemporaryDirectory()
                 with zipfile.ZipFile(str(input_path), 'r') as zf:
                     zf.extractall(temp_dir_obj.name)
                 working_directory = temp_dir_obj.name
-                self._log_message(f"✓ Extracted ZIP to temp workspace: {working_directory}")
+                self._log_message("✓ Archive extracted to temp workspace")
             
             self._log_message("="*60)
             self._log_message("🚀 Starting Bibliography Processing Pipeline")
@@ -757,44 +1247,89 @@ class ModernBibGUI:
             
             # Initialize manager
             self.manager = BibliographyManager(working_directory)
-            self._ui_call(self.progress.set, 0.1)
             
             # Step 1: Crawl
-            self._log_message("\n📁 Step 1/4: Crawling for .bib files...")
+            if not self.processing:
+                self._log_message("⚠️ Pipeline cancelled by user.")
+                return
+            self._mark_step_running("Crawl", "Scanning .bib files...")
+            self._log_message("📁 Crawling for .bib files...")
             num_files, num_entries = self.manager.crawl_and_collect()
-            self._log_message(f"✓ Found {num_files} files with {num_entries} entries")
-            self._ui_call(self.progress.set, 0.3)
+            self._log_message(f"✓ Found {num_files} file(s) with {num_entries} entries")
+            self._mark_step_complete("Crawl")
             
             if num_entries == 0:
                 self._log_message("\n⚠️ No entries found!")
                 return
             
             # Step 2: Find duplicates
-            self._log_message(f"\n🔍 Step 2/4: Finding duplicates (threshold: {threshold}%)...")
-            num_groups = self.manager.find_duplicates(threshold=float(threshold))
-            self._log_message(f"✓ Found {num_groups} duplicate groups")
-            self._ui_call(self.progress.set, 0.5)
+            if not self.processing:
+                self._log_message("⚠️ Pipeline cancelled by user.")
+                return
+            self._mark_step_running("Duplicates", f"Comparing entries (threshold: {threshold}%)...")
+            self._log_message(f"🔍 Finding duplicates (threshold: {threshold}%)...")
+            num_groups = self.manager.find_duplicates(threshold=threshold)
+            self._log_message(f"✓ Found {num_groups} duplicate group(s)")
+            self._mark_step_complete("Duplicates")
             
             # Step 3: Remove duplicates
-            self._log_message("\n🗑️ Step 3/4: Removing duplicates...")
+            if not self.processing:
+                self._log_message("⚠️ Pipeline cancelled by user.")
+                return
+            self._mark_step_running("Remove", "Removing duplicate entries...")
+            self._log_message("🗑️ Removing duplicates...")
             self.manager.remove_duplicates()
-            self._log_message(f"✓ Removed {self.manager.report_data['duplicates_removed']} duplicates")
-            self._ui_call(self.progress.set, 0.7)
+            self._log_message(f"✓ Removed {self.manager.report_data['duplicates_removed']} entries")
+            self._mark_step_complete("Remove")
             
             # Step 4: Fix keys
-            self._log_message("\n🔑 Step 4/4: Normalizing citation keys...")
-            self.manager.fix_citation_keys()
-            self._log_message(f"✓ Normalized {len(self.manager.report_data['keys_changed'])} keys")
+            if not self.processing:
+                self._log_message("⚠️ Pipeline cancelled by user.")
+                return
+            self._mark_step_running("Keys", "Normalizing citation keys...")
+            self._log_message("🔑 Normalizing citation keys...")
+            # Pass user rule to backend
+            rule = self.citekey_rule_var.get()
+            custom = self.citekey_custom_var.get()
+            if rule == "custom":
+                citekey_format = custom
+            elif rule == "author-year-title":
+                citekey_format = "{author}-{year}-{title}"
+            elif rule == "author-year-titleword":
+                citekey_format = "{author}-{year}-{titleword}"
+            elif rule == "author-title":
+                citekey_format = "{author}-{title}"
+            elif rule == "professor-style":
+                citekey_format = "{authorstem}{year}"
+            elif rule == "professor-strict":
+                citekey_format = "{authorstrict}{year}"
+            elif rule == "author-et-al-year":
+                citekey_format = "{authoretal}{year}"
+            elif rule == "lastname-only-year":
+                citekey_format = "{lastname}{year}"
+            elif rule == "firstauthor-year-titleword":
+                citekey_format = "{author}{year}{titleword}"
+            elif rule == "compact-initials":
+                citekey_format = "{authorinitials}{year}"
+            elif rule == "numeric":
+                citekey_format = "ref{numeric}"
+            else:
+                citekey_format = "{author}-{year}-{title}"
+            self.manager.fix_citation_keys(citekey_format)
+            self._log_message(f"✓ Normalized {len(self.manager.report_data['keys_changed'])} key(s)")
+            self._mark_step_complete("Keys")
             
             # Create master
-            self._log_message("\n💾 Creating master bibliography...")
+            self._log_message("📋 Creating master bibliography...")
             master_path = self.manager.create_master_bibliography()
-            self._log_message(f"✓ Created: {master_path}")
+            self._log_message(f"✓ Master file generated")
             self._last_master_path = str(master_path)
-            self._ui_call(self.progress.set, 0.85)
             
             # Push back if requested
             if push_back:
+                if not self.processing:
+                    self._log_message("⚠️ Pipeline cancelled by user.")
+                    return
                 self._log_message("\n📤 Pushing master.bib to folders...")
                 self.manager.push_to_folders(master_path)
                 self._log_message("✓ Distribution complete")
@@ -802,9 +1337,9 @@ class ModernBibGUI:
             # Generate report
             self.manager.report_data['end_time'] = self.manager.report_data.get('end_time') or __import__('datetime').datetime.now()
             if generate_report:
-                self._log_message("\n📊 Generating HTML report...")
+                self._log_message("📊 Generating HTML report...")
                 self.report_path = self.manager.generate_html_report()
-                self._log_message(f"✓ Report: {self.report_path}")
+                self._log_message("✓ Report generated")
                 self._ui_call(self.view_report_btn.configure, state="normal")
 
             # If input was ZIP, package processed files into a new ZIP and copy report outside temp dir.
@@ -849,15 +1384,22 @@ class ModernBibGUI:
                 except Exception:
                     pass
             
-            self._ui_call(self.progress.set, 1.0)
             
             # Update results
             self._ui_call(self._update_results)
-            self._ui_call(self._update_duplicates)
+            # Defer heavy duplicates rendering until user opens the Duplicates tab.
+            self._pending_duplicates_refresh = True
             
-            self._log_message("\n" + "="*60)
+            # Update current step to show completion
+            self._pending_step_text = "✅ All steps completed! Results available below."
+            self._pending_step_color = "#10b981"
+            self._ui_call(self._apply_pipeline_snapshot)
+            
+            self._log_message("")
+            self._log_message("="*60)
             self._log_message("✨ Pipeline completed successfully!")
             self._log_message("="*60)
+            self._set_status("Completed", "#22c55e")
 
             # Show completion popup with output locations (on UI thread)
             def _show_done_popup():
@@ -877,9 +1419,16 @@ class ModernBibGUI:
             self._ui_call(_show_done_popup)
             
         except Exception as e:
-            self._log_message(f"\n❌ Error: {str(e)}")
+            error_msg = str(e)
+            self._log_message(f"\n❌ Error: {error_msg}")
             import traceback
             self._log_message(traceback.format_exc())
+            self._set_status("Error", "#ef4444")
+            
+            # Mark current step as error
+            self._pending_step_text = f"❌ Pipeline failed: {error_msg}"
+            self._pending_step_color = "#ef4444"
+            self._ui_call(self._apply_pipeline_snapshot)
             
         finally:
             if temp_dir_obj is not None:
@@ -887,18 +1436,26 @@ class ModernBibGUI:
                     temp_dir_obj.cleanup()
                 except Exception:
                     pass
+
+            # Render buffered logs once processing is done.
+            self._defer_log_render = False
+            self._flush_deferred_logs()
+
             self.processing = False
             self._ui_call(self.run_btn.configure, state="normal")
             self._ui_call(self.cancel_btn.configure, state="disabled")
+            if self._status_text.get() == "Running...":
+                self._set_status("Ready", "#3b8ed0")
             
     def _cancel_pipeline(self):
         """Cancel pipeline execution"""
         # Simple cancellation (thread will finish current operation)
         self.processing = False
         self._log_message("\n⚠️ Cancellation requested...")
+        self._set_status("Cancelling...", "#f59e0b")
         
     def _update_results(self):
-        """Update results tab with statistics"""
+        """Update results tab with statistics and progress bars"""
         if not self.manager:
             return
         
@@ -916,9 +1473,18 @@ class ModernBibGUI:
             duration = (data['end_time'] - data['start_time']).total_seconds()
             self.stat_labels['time'].configure(text=f"{duration:.1f}s")
         
-        # Detailed summary
+        # Update progress bars with visual feedback
         reduction_rate = (data['duplicates_removed'] / max(data['initial_entries'], 1)) * 100
+        self.reduction_bar.set(reduction_rate / 100.0)
+        self.reduction_text.configure(text=f"{reduction_rate:.1f}% reduction")
         
+        # Normalized keys progress (max reasonable is 500 keys)
+        keys_count = len(data['keys_changed'])
+        max_keys = max(500, keys_count + 1)
+        self.keys_bar.set(min(keys_count / max_keys, 1.0))
+        self.keys_text.configure(text=f"{keys_count} keys normalized")
+        
+        # Detailed summary
         lines = []
         lines.append("Processing Summary")
         lines.append("=" * 50)
@@ -931,6 +1497,9 @@ class ModernBibGUI:
         lines.append("")
         lines.append(f"Reduction Rate: {reduction_rate:.1f}%")
         lines.append(f"Keys Normalized: {len(data['keys_changed'])}")
+        if data.get('tex_citation_updates', 0):
+            lines.append(f"LaTeX Citations Updated: {data['tex_citation_updates']}")
+            lines.append(f".tex Files Updated: {data.get('tex_files_updated', 0)}")
         lines.append("")
         lines.append("=" * 50)
         lines.append("✓ All original files backed up with timestamps")
@@ -942,35 +1511,392 @@ class ModernBibGUI:
         self.results_text.delete("1.0", "end")
         self.results_text.insert("1.0", summary)
         
+    def _mark_step_complete(self, step_name: str):
+        """Mark a pipeline step as complete with timing"""
+        if step_name in self.step_cards:
+            card_data = self.step_cards[step_name]
+            self._step_state[step_name] = "complete"
+            # Calculate and display time taken
+            if card_data['start_time']:
+                import time
+                elapsed = time.time() - card_data['start_time']
+                self.step_timers[step_name] = elapsed
+            if not self._defer_log_render:
+                self._ui_call(self._apply_pipeline_snapshot)
+    
+    def _mark_step_running(self, step_name: str, detail_text: str = ""):
+        """Mark a pipeline step as currently running"""
+        if step_name in self.step_cards:
+            card_data = self.step_cards[step_name]
+            import time
+            card_data['start_time'] = time.time()
+            self._step_state[step_name] = "running"
+
+            # Update current step text
+            detail_msg = detail_text if detail_text else f"Processing {step_name}..."
+            self._pending_step_text = detail_msg
+            self._pending_step_color = "#d1d5db"
+            if not self._defer_log_render:
+                self._ui_call(self._apply_pipeline_snapshot)
+    
+    def _mark_step_error(self, step_name: str, error_msg: str = ""):
+        """Mark a pipeline step as failed"""
+        if step_name in self.step_cards:
+            self._step_state[step_name] = "error"
+            error_detail = error_msg if error_msg else "An error occurred"
+            self._pending_step_text = f"❌ {error_detail}"
+            self._pending_step_color = "#ef4444"
+            if not self._defer_log_render:
+                self._ui_call(self._apply_pipeline_snapshot)
+
+    def _apply_pipeline_snapshot(self):
+        """Apply all pipeline step statuses in one UI pass to avoid flashing."""
+        state_style = {
+            "pending": ("⌚ Pending", "#9ca3af"),
+            "running": ("⏳ Running", "#fbbf24"),
+            "complete": ("✓ Complete", "#34d399"),
+            "error": ("✗ Error", "#f87171"),
+        }
+
+        for step_name, card_data in self.step_cards.items():
+            state = self._step_state.get(step_name, "pending")
+            status_text, status_color = state_style.get(state, state_style["pending"])
+            card_data['status'].configure(text=status_text, fg_color="transparent", text_color=status_color)
+            card_data['timer'].configure(text=f"{self.step_timers.get(step_name, 0.0):.1f}s")
+
+        self.current_step_label.configure(
+            text=self._pending_step_text,
+            text_color=self._pending_step_color,
+        )
+        
     def _update_duplicates(self):
-        """Update duplicates tab"""
-        if not self.manager:
+        """Update duplicates tab using a single-group text render for speed and readability."""
+        if not self.manager or not hasattr(self, 'duplicates_text'):
             return
-        
-        self.duplicates_text.delete("1.0", "end")
-        
-        if not self.manager.report_data['duplicate_groups']:
-            self.duplicates_text.insert("1.0", "No duplicates found! ✨")
+
+        groups = self.manager.report_data.get('duplicate_groups', [])
+        self._duplicate_groups_cache = groups
+
+        if not groups:
+            self.dup_group_menu.configure(values=["No groups"])
+            self.dup_group_menu.set("No groups")
+            self.dup_prev_btn.configure(state="disabled")
+            self.dup_next_btn.configure(state="disabled")
+            self.dup_summary_label.configure(text="No duplicates found. Your bibliography is clean.")
+            self.duplicates_text.delete("1.0", "end")
+            self.duplicates_text.insert("1.0", "No duplicates found. Your bibliography is clean.\n")
             return
-        
-        for idx, group_data in enumerate(self.manager.report_data['duplicate_groups'], 1):
-            entries = group_data['entries']
+
+        labels = []
+        for idx, group_data in enumerate(groups, 1):
             similarity = group_data.get('similarity', 'N/A')
-            
-            self.duplicates_text.insert("end", f"\n{'─'*60}\n")
-            self.duplicates_text.insert("end", f"Duplicate Group {idx} | Similarity: {similarity}%\n")
-            self.duplicates_text.insert("end", f"{'─'*60}\n\n")
-            
-            for entry_idx, entry in enumerate(entries):
-                status = "✅ KEPT" if entry_idx == 0 else "❌ REMOVED"
-                title = entry.get('title', 'No title').replace('{', '').replace('}', '')[:80]
-                author = entry.get('author', 'Unknown')[:40]
-                year = entry.get('year', 'N/A')
-                key = entry.get('ID', 'unknown')
-                
-                self.duplicates_text.insert("end", f"{status} [{key}]\n")
-                self.duplicates_text.insert("end", f"  📄 {title}...\n")
-                self.duplicates_text.insert("end", f"  👤 {author} | 📅 {year}\n\n")
+            entries = group_data.get('entries', [])
+            labels.append(f"Group {idx:03d} | {similarity}% | {len(entries)} entries")
+
+        self.dup_group_menu.configure(values=labels)
+        self._selected_duplicate_group = min(self._selected_duplicate_group, len(groups) - 1)
+        self.dup_group_menu.set(labels[self._selected_duplicate_group])
+        self.dup_prev_btn.configure(state="normal")
+        self.dup_next_btn.configure(state="normal")
+        self._selected_duplicate_file = 0
+        self._render_selected_duplicate_group()
+
+    def _on_duplicate_group_selected(self, selection: str):
+        """Handle dropdown selection for duplicate group."""
+        if not self._duplicate_groups_cache:
+            return
+        try:
+            idx_text = selection.split("|")[0].strip().replace("Group", "").strip()
+            idx = int(idx_text) - 1
+        except Exception:
+            return
+
+        if 0 <= idx < len(self._duplicate_groups_cache):
+            self._selected_duplicate_group = idx
+            self._render_selected_duplicate_group()
+
+    def _show_prev_duplicate_group(self):
+        """Navigate to previous duplicate group."""
+        if not self._duplicate_groups_cache:
+            return
+        self._selected_duplicate_group = (self._selected_duplicate_group - 1) % len(self._duplicate_groups_cache)
+        self._sync_duplicate_selection_and_render()
+
+    def _show_next_duplicate_group(self):
+        """Navigate to next duplicate group."""
+        if not self._duplicate_groups_cache:
+            return
+        self._selected_duplicate_group = (self._selected_duplicate_group + 1) % len(self._duplicate_groups_cache)
+        self._sync_duplicate_selection_and_render()
+
+    def _on_duplicate_file_selected(self, selection: str):
+        if not self._duplicate_file_order:
+            return
+        try:
+            idx = self._duplicate_file_order.index(selection)
+        except ValueError:
+            return
+        self._selected_duplicate_file = idx
+        self._render_selected_duplicate_group()
+
+    def _show_prev_duplicate_file(self):
+        if not self._duplicate_file_order:
+            return
+        self._selected_duplicate_file = (self._selected_duplicate_file - 1) % len(self._duplicate_file_order)
+        self._sync_duplicate_file_selection_and_render()
+
+    def _show_next_duplicate_file(self):
+        if not self._duplicate_file_order:
+            return
+        self._selected_duplicate_file = (self._selected_duplicate_file + 1) % len(self._duplicate_file_order)
+        self._sync_duplicate_file_selection_and_render()
+
+    def _sync_duplicate_file_selection_and_render(self):
+        if not self._duplicate_file_order:
+            return
+        self.dup_file_menu.set(self._duplicate_file_order[self._selected_duplicate_file])
+        self._render_selected_duplicate_group()
+
+    def _show_prev_duplicate_highlight(self):
+        if not self._duplicate_highlight_positions:
+            return
+        self._selected_duplicate_highlight = (self._selected_duplicate_highlight - 1) % len(self._duplicate_highlight_positions)
+        self._scroll_to_duplicate_highlight()
+
+    def _show_next_duplicate_highlight(self):
+        if not self._duplicate_highlight_positions:
+            return
+        self._selected_duplicate_highlight = (self._selected_duplicate_highlight + 1) % len(self._duplicate_highlight_positions)
+        self._scroll_to_duplicate_highlight()
+
+    def _scroll_to_duplicate_highlight(self):
+        if not self._duplicate_highlight_positions:
+            return
+        line_no, status = self._duplicate_highlight_positions[self._selected_duplicate_highlight]
+        status_text = "KEEP" if status == 'kept' else "DROP"
+        self.dup_file_label.configure(
+            text=f"File: {self._current_duplicate_display_name} | Active: {status_text} line {line_no}"
+        )
+        tk_text = (
+            getattr(self.duplicates_text, '_textbox', None)
+            or getattr(self.duplicates_text, 'textbox', None)
+            or getattr(self.duplicates_text, 'text', None)
+        )
+        if tk_text is not None:
+            try:
+                tk_text.see(f"{line_no}.0")
+                tk_text.mark_set("insert", f"{line_no}.0")
+            except Exception:
+                pass
+
+    def _sync_duplicate_selection_and_render(self):
+        """Sync option menu label with selected group and re-render."""
+        if not self._duplicate_groups_cache:
+            return
+        group = self._duplicate_groups_cache[self._selected_duplicate_group]
+        similarity = group.get('similarity', 'N/A')
+        entries = group.get('entries', [])
+        label = f"Group {self._selected_duplicate_group + 1:03d} | {similarity}% | {len(entries)} entries"
+        self.dup_group_menu.set(label)
+        self._render_selected_duplicate_group()
+
+    def _render_selected_duplicate_group(self):
+        """Render the full file for the selected duplicate group, highlight KEEP/DROP lines, and allow navigation."""
+        if not self._duplicate_groups_cache:
+            return
+
+        group_data = self._duplicate_groups_cache[self._selected_duplicate_group]
+        entries = group_data.get('entries', [])
+        similarity = group_data.get('similarity', 'N/A')
+
+        self.dup_summary_label.configure(
+            text=(
+                f"Group {self._selected_duplicate_group + 1} of {len(self._duplicate_groups_cache)}"
+                f" | Similarity: {similarity}% | Entries: {len(entries)}"
+            )
+        )
+
+        file_map = {}
+        file_order = []
+        for entry in entries:
+            src = entry.get('_source_file')
+            start_line = entry.get('_entry_start_line') or entry.get('_line_number')
+            end_line = entry.get('_entry_end_line') or start_line
+            status = entry.get('_status')
+            if src and start_line:
+                if src not in file_map:
+                    file_order.append(src)
+                    file_map[src] = []
+                file_map[src].append(entry)
+
+        if not file_order:
+            self._duplicate_file_order = []
+            self.dup_file_menu.configure(values=["No files"])
+            self.dup_file_menu.set("No files")
+            self.dup_file_prev_btn.configure(state="disabled")
+            self.dup_file_next_btn.configure(state="disabled")
+            self.dup_file_label.configure(text="File: -")
+            self.duplicates_text.delete("1.0", "end")
+            self.duplicates_text.insert("1.0", "No file data for this group.")
+            return
+
+        source_files = self.manager.report_data.get('source_files', {}) if self.manager else {}
+        self._duplicate_file_order = []
+        for src in file_order:
+            cached_source = source_files.get(src, {}) if isinstance(source_files, dict) else {}
+            display_name = cached_source.get('relative_path', Path(src).name)
+            self._duplicate_file_order.append(display_name)
+
+        self.dup_file_menu.configure(values=self._duplicate_file_order)
+        self.dup_file_prev_btn.configure(state="normal" if len(self._duplicate_file_order) > 1 else "disabled")
+        self.dup_file_next_btn.configure(state="normal" if len(self._duplicate_file_order) > 1 else "disabled")
+        self._selected_duplicate_file = min(self._selected_duplicate_file, len(self._duplicate_file_order) - 1)
+        selected_display_name = self._duplicate_file_order[self._selected_duplicate_file]
+        self.dup_file_menu.set(selected_display_name)
+
+        selected_src = file_order[self._selected_duplicate_file]
+        cached_source = source_files.get(selected_src, {}) if isinstance(source_files, dict) else {}
+        file_text = cached_source.get('text')
+        display_name = cached_source.get('relative_path', Path(selected_src).name)
+        self._current_duplicate_display_name = display_name
+        self.dup_file_label.configure(text=f"File: {display_name}")
+
+        if file_text is None:
+            try:
+                with open(selected_src, encoding='utf-8') as f:
+                    file_text = f.read()
+            except Exception as e:
+                self.duplicates_text.delete("1.0", "end")
+                self.duplicates_text.insert("1.0", f"Could not read file: {display_name}\n{e}")
+                return
+
+        selected_entries = file_map[selected_src]
+        display_lines = [f"File: {display_name}", "=" * 90]
+        highlight_ranges = []
+        self._duplicate_highlight_positions = []
+        keep_entries = [(idx + 1, entry) for idx, entry in enumerate(entries) if entry.get('_status') == 'kept']
+        drop_entries = [(idx + 1, entry) for idx, entry in enumerate(entries) if entry.get('_status') != 'kept']
+
+        keep_lines = ["MASTER COPY (kept)", "", "One canonical record from this duplicate group is kept in the cleaned bibliography.", ""]
+        drop_lines = ["DUPLICATE COPY (removed)", "", "This record is removed because it belongs to the same duplicate group as the kept record.", ""]
+
+        def _entry_summary(record_number, entry):
+            line_no = entry.get('_line_number', 'N/A')
+            end_line = entry.get('_entry_end_line', line_no)
+            file_name = entry.get('_source_file_display') or Path(entry.get('_source_file', '')).name
+            author = str(entry.get('author', 'Unknown')).replace('{', '').replace('}', '')
+            year = str(entry.get('year', 'N/A'))
+            title = str(entry.get('title', 'No title')).replace('{', '').replace('}', '')
+            key = str(entry.get('ID', 'unknown'))
+            return f"record {record_number} | lines {line_no}-{end_line} | {file_name} | {author} ({year}) | {title} | key: {key}"
+
+        for entry in selected_entries:
+            start_line = entry.get('_entry_start_line') or entry.get('_line_number')
+            end_line = entry.get('_entry_end_line') or start_line
+            status = entry.get('_status')
+            if not isinstance(start_line, int) or not isinstance(end_line, int):
+                continue
+            marker = "[KEEP]" if status == 'kept' else "[DROP]"
+            text_line_no = len(display_lines) + 1
+            highlight_ranges.extend((line_no, status) for line_no in range(text_line_no, text_line_no + (end_line - start_line + 1)))
+            self._duplicate_highlight_positions.append((text_line_no, status))
+
+            entry_text = entry.get('_entry_text') or ""
+            if not entry_text:
+                block_lines = file_text.splitlines()[start_line - 1:end_line]
+                entry_text = "\n".join(block_lines)
+
+            display_lines.append(f"{start_line:4d} {marker:7} | {entry_text.splitlines()[0].rstrip()}")
+            for offset, block_line in enumerate(entry_text.splitlines()[1:], start=1):
+                display_lines.append(f"{start_line + offset:4d} {'':7} | {block_line.rstrip()}")
+            display_lines.append("")
+
+        if keep_entries:
+            record_number, keep_entry = keep_entries[0]
+            keep_fields = keep_entry.get('_merge_field_count', 'N/A')
+            keep_lines.append(f"Kept entry: {_entry_summary(record_number, keep_entry)}")
+            if len(keep_entries) > 1:
+                keep_lines.append(f"Additional kept entries: {len(keep_entries) - 1}")
+            keep_lines.append("Reason: deduplication keeps one representative record per duplicate group.")
+            keep_lines.append(f"Completeness score: {keep_fields} non-empty fields (highest in this group).")
+
+            merged_field_names = []
+            for _, drop_entry in drop_entries:
+                merged_field_names.extend(drop_entry.get('_merged_into_master_fields', []))
+            merged_field_names = sorted(set(merged_field_names))
+            if merged_field_names:
+                keep_lines.append("Fields merged from removed copies: " + ", ".join(merged_field_names))
+            else:
+                keep_lines.append("Fields merged from removed copies: none (kept entry already had all populated fields).")
+
+            keep_text = keep_entry.get('_entry_text') or ""
+            if keep_text:
+                keep_lines.append("")
+                keep_lines.append("Entry block:")
+                keep_lines.append(keep_text.rstrip())
+        else:
+            keep_lines.append("No kept entry was recorded for this group.")
+
+        if drop_entries:
+            for record_number, drop_entry in drop_entries:
+                drop_fields = drop_entry.get('_merge_field_count', 'N/A')
+                drop_lines.append(_entry_summary(record_number, drop_entry))
+                drop_lines.append(f"Completeness score: {drop_fields} non-empty fields")
+                contributed = drop_entry.get('_merged_into_master_fields', [])
+                if contributed:
+                    drop_lines.append("Contributes missing fields to kept record: " + ", ".join(contributed))
+                else:
+                    drop_lines.append("Contributes missing fields to kept record: none")
+                drop_text = drop_entry.get('_entry_text') or ""
+                if drop_text:
+                    drop_lines.append("Entry block:")
+                    drop_lines.append(drop_text.rstrip())
+                    drop_lines.append("")
+            drop_lines.append("")
+            drop_lines.append(f"Reason: this whole BibTeX entry block is removed because it duplicates the master copy (similarity {similarity}%).")
+            drop_lines.append("Note: identical text is expected here because the duplicate entry matches the kept one.")
+        else:
+            drop_lines.append("No removed entry was recorded for this group.")
+
+        self.duplicates_text.delete("1.0", "end")
+        self.duplicates_text.insert("1.0", "\n".join(display_lines))
+        self.dup_keep_box.delete("1.0", "end")
+        self.dup_keep_box.insert("1.0", "\n".join(keep_lines))
+        self.dup_drop_box.delete("1.0", "end")
+        self.dup_drop_box.insert("1.0", "\n".join(drop_lines))
+
+        try:
+            tk_text = (
+                getattr(self.duplicates_text, '_textbox', None)
+                or getattr(self.duplicates_text, 'textbox', None)
+                or getattr(self.duplicates_text, 'text', None)
+            )
+            if tk_text is None:
+                return
+            for tag in ('hl_keep', 'hl_drop'):
+                try:
+                    tk_text.tag_delete(tag)
+                except Exception:
+                    pass
+            tk_text.tag_configure('hl_keep', background='#b6f2c7', foreground='#111111')
+            tk_text.tag_configure('hl_drop', background='#ffb3b3', foreground='#111111')
+            seen_lines = set()
+            for line_no, status in highlight_ranges:
+                if line_no in seen_lines:
+                    continue
+                seen_lines.add(line_no)
+                start = f"{line_no}.0"
+                end = f"{line_no}.end"
+                if status == 'kept':
+                    tk_text.tag_add('hl_keep', start, end)
+                else:
+                    tk_text.tag_add('hl_drop', start, end)
+        except Exception:
+            pass
+
+        if self._duplicate_highlight_positions:
+            self._selected_duplicate_highlight = min(self._selected_duplicate_highlight, len(self._duplicate_highlight_positions) - 1)
+            self._scroll_to_duplicate_highlight()
 
     def _show_file_fix(self, selection: str):
         """Display original and updated contents for selected file, marking changed lines."""

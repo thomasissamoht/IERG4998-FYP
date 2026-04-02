@@ -14,6 +14,7 @@ This tool helps manage BibTeX bibliography files by:
 import os
 import sys
 import shutil
+from io import StringIO
 from pathlib import Path
 from datetime import datetime
 from typing import Any, List, Dict, Tuple, Set
@@ -63,15 +64,105 @@ class BibliographyManager:
             'end_time': None,
             'files_found': 0,
             'initial_entries': 0,
+            'source_files': {},
             'duplicate_groups': [],
             'duplicates_removed': 0,
             'keys_changed': [],
+            'tex_files_updated': 0,
+            'tex_citation_updates': 0,
             'final_entries': 0
         }
         self.all_entries: List[Dict] = []
         self.master_db = BibDatabase()
         self.duplicate_groups: List[List[int]] = []
+
+    def _merge_field_count(self, entry: Dict) -> int:
+        """Count non-empty merge-relevant fields for an entry."""
+        return sum(
+            1
+            for k, v in entry.items()
+            if k not in ['_source_file', 'ID', '_line_number', '_status']
+            and isinstance(v, str)
+            and v.strip()
+        )
+
+    def _select_group_master_position(self, group: List[int]) -> int:
+        """Return the position within group of the entry kept as merge base."""
+        scored = []
+        for position, idx in enumerate(group):
+            entry = self.all_entries[idx]
+            scored.append((self._merge_field_count(entry), idx, position))
+        scored.sort(reverse=True)
+        return scored[0][2]
+
+    def _merge_contributed_fields(self, base_entry: Dict, other_entry: Dict) -> List[str]:
+        """Return fields that would be copied from other_entry into base_entry during merge."""
+        contributed = []
+        for key, value in other_entry.items():
+            if key in ['_source_file', 'ID', '_line_number', '_status']:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+            base_value = base_entry.get(key)
+            if key not in base_entry or (isinstance(base_value, str) and not base_value.strip()):
+                contributed.append(key)
+        return sorted(contributed)
         
+    def _extract_line_numbers(self, file_path: str) -> Dict[str, int]:
+        """Extract line numbers for each entry in a .bib file
+        
+        Args:
+            file_path: Path to the .bib file
+            
+        Returns:
+            Dictionary mapping entry IDs to their starting line numbers
+        """
+        line_numbers = {}
+        try:
+            with open(file_path, encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            for line_num, line in enumerate(lines, 1):
+                # Match @article, @book, @incollection, etc.
+                match = re.match(r'@[a-zA-Z]+\s*\{\s*([^,\s]+)', line)
+                if match:
+                    entry_id = match.group(1).strip()
+                    line_numbers[entry_id] = line_num
+        except Exception as e:
+            print(f"⚠️  Error extracting line numbers from {file_path}: {e}")
+        
+        return line_numbers
+
+    def _extract_entry_block(self, lines: List[str], start_line: int) -> Tuple[str, int]:
+        """Extract a full BibTeX entry block from a file.
+
+        Args:
+            lines: File contents split into lines with line endings preserved.
+            start_line: 1-based line number where the entry starts.
+
+        Returns:
+            A tuple of (entry_text, end_line).
+        """
+        if start_line < 1 or start_line > len(lines):
+            return "", start_line
+
+        block_lines = []
+        brace_balance = 0
+        started = False
+        end_line = start_line
+
+        for line_index in range(start_line - 1, len(lines)):
+            line = lines[line_index]
+            block_lines.append(line)
+            brace_balance += line.count('{') - line.count('}')
+            if '{' in line:
+                started = True
+            if started and brace_balance <= 0:
+                end_line = line_index + 1
+                break
+
+        return ''.join(block_lines), end_line
+    
     def crawl_and_collect(self) -> Tuple[int, int]:
         """Crawl through folders to find all .bib files and collect entries
         
@@ -101,16 +192,60 @@ class BibliographyManager:
         
         # Collect all entries from all files
         self.all_entries = []
+        self.report_data['source_files'] = {}
         
         for bib_file in self.bib_files:
             try:
+                # Extract line numbers first
+                line_numbers = self._extract_line_numbers(str(bib_file))
+                
                 with open(bib_file, encoding='utf-8') as f:
+                    file_text = f.read()
+                    file_lines = file_text.splitlines(keepends=True)
+                    entry_start_lines = []
+                    entry_line_occurrences: Dict[str, List[int]] = {}
+                    for line_num, line in enumerate(file_lines, start=1):
+                        match = re.match(r'@[a-zA-Z]+\s*\{\s*([^,\s]+)', line)
+                        if not match:
+                            continue
+                        key = match.group(1).strip()
+                        entry_start_lines.append(line_num)
+                        if key not in entry_line_occurrences:
+                            entry_line_occurrences[key] = []
+                        entry_line_occurrences[key].append(line_num)
                     # Create a NEW parser for each file to avoid accumulation
                     parser = BibTexParser(common_strings=True)
-                    db = bibtexparser.load(f, parser=parser)
+                    db = bibtexparser.load(StringIO(file_text), parser=parser)
+
+                    relative_path = str(bib_file.relative_to(self.root_directory))
+                    self.report_data['source_files'][str(bib_file)] = {
+                        'relative_path': relative_path,
+                        'text': file_text,
+                    }
+
+                    fallback_index = 0
                     for entry in db.entries:
-                        # Store source file information
+                        # Store source file information and line number
+                        entry_id = entry.get('ID', '').strip()
+                        id_lines = entry_line_occurrences.get(entry_id, [])
+                        if id_lines:
+                            start_line = id_lines.pop(0)
+                        elif fallback_index < len(entry_start_lines):
+                            start_line = entry_start_lines[fallback_index]
+                            fallback_index += 1
+                        else:
+                            start_line = line_numbers.get(entry_id, 'N/A')
+                        entry_text = ''
+                        end_line = start_line
+                        if isinstance(start_line, int):
+                            entry_text, end_line = self._extract_entry_block(file_lines, start_line)
+
                         entry['_source_file'] = str(bib_file)
+                        entry['_source_file_display'] = relative_path
+                        entry['_line_number'] = start_line
+                        entry['_entry_text'] = entry_text
+                        entry['_entry_start_line'] = start_line
+                        entry['_entry_end_line'] = end_line
                         self.all_entries.append(entry)
             except Exception as e:
                 print(f"⚠️  Error reading {bib_file}: {e}")
@@ -168,6 +303,44 @@ class BibliographyManager:
                     last_names.append(parts[-1])
         
         return last_names
+
+    def _professor_author_fragment(self, author_string: str) -> str:
+        """Build a compact author fragment for professor-style keys.
+
+        Examples:
+            Huang -> hua
+            Huang and Wang -> huw
+            Huang and Wang and Zhao -> hwz
+        """
+        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
+        surnames = [name for name in surnames if name]
+        if not surnames:
+            return "unk"
+        if len(surnames) == 1:
+            return surnames[0][:3] or "unk"
+        if len(surnames) == 2:
+            return f"{surnames[0][:2]}{surnames[1][:1]}" or "unk"
+        return ''.join(name[:1] for name in surnames[:3]) or "unk"
+
+    def _strict_professor_author_fragment(self, author_string: str) -> str:
+        """Build the professor's strict key fragment using the same naming rule."""
+        return self._professor_author_fragment(author_string)
+
+    def _author_etal_fragment(self, author_string: str) -> str:
+        """Build an author-et-al fragment for citation keys."""
+        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
+        surnames = [name for name in surnames if name]
+        if not surnames:
+            return "unk"
+        if len(surnames) == 1:
+            return surnames[0]
+        return f"{surnames[0]}etal"
+
+    def _lastname_year_fragment(self, author_string: str) -> str:
+        """Build a lastname-only fragment from the first author."""
+        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
+        surnames = [name for name in surnames if name]
+        return surnames[0] if surnames else "unk"
     
     def compute_similarity(self, entry1: Dict, entry2: Dict) -> float:
         """Compute similarity score between two entries
@@ -277,19 +450,34 @@ class BibliographyManager:
         for group_num, group in enumerate(self.duplicate_groups, 1):
             print(f"  Duplicate Group {group_num} ({len(group)} entries):")
             group_entries = []
-            for idx in group:
-                entry = self.all_entries[idx]
+            kept_position = self._select_group_master_position(group)
+            kept_entry = self.all_entries[group[kept_position]]
+            for idx_in_group, entry_idx in enumerate(group):
+                entry = self.all_entries[entry_idx]
                 title = entry.get('title', 'NO TITLE')[:60]
                 key = entry.get('ID', 'NO_KEY')
-                print(f"    - [{idx}] {key}: {title}...")
-                group_entries.append(entry)
+                status = "KEPT" if idx_in_group == kept_position else "REMOVED"
+                print(f"    - [{entry_idx}] {key}: {title}... ({status})")
+                contributed_fields = []
+                if idx_in_group != kept_position:
+                    contributed_fields = self._merge_contributed_fields(kept_entry, entry)
+
+                # Add status and line number to entry dict
+                group_entries.append({
+                    **entry,
+                    '_status': 'kept' if idx_in_group == kept_position else 'removed',
+                    '_merge_field_count': self._merge_field_count(entry),
+                    '_merged_into_master_fields': contributed_fields
+                })
             print()
             
             # Store in report data
             similarity_score = self.compute_similarity(self.all_entries[group[0]], self.all_entries[group[1]]) if len(group) > 1 else 100
             self.report_data['duplicate_groups'].append({
                 'entries': group_entries,
-                'similarity': round(similarity_score, 1)
+                'similarity': round(similarity_score, 1),
+                'entry_indices': group,  # Store original indices for reference
+                'kept_position': kept_position
             })
         
         return len(self.duplicate_groups)
@@ -307,8 +495,7 @@ class BibliographyManager:
         scored = []
         for idx in group:
             entry = self.all_entries[idx]
-            field_count = sum(1 for k, v in entry.items() 
-                            if k not in ['_source_file', 'ID'] and v.strip())
+            field_count = self._merge_field_count(entry)
             scored.append((field_count, idx, entry))
         
         # Pick the entry with most fields as base
@@ -321,7 +508,12 @@ class BibliographyManager:
         # Merge in fields from other entries if they're missing in base
         for _, _, entry in scored[1:]:
             for key, value in entry.items():
-                if key not in merged or not merged[key].strip():
+                # Skip metadata fields and non-string values
+                if key in ['_source_file', 'ID', '_line_number', '_status']:
+                    continue
+                if not isinstance(value, str):
+                    continue
+                if key not in merged or (isinstance(merged.get(key), str) and not merged[key].strip()):
                     if value.strip():
                         merged[key] = value
         
@@ -366,26 +558,25 @@ class BibliographyManager:
         print(f"✓ Removed {duplicates_removed} duplicate entries")
         print(f"✓ Final count: {len(self.all_entries)} unique entries\n")
     
-    def generate_citation_key(self, entry: Dict, existing_keys: Set[str]) -> str:
-        """Generate a consistent, informative citation key for an entry.
-
-        Format: firstauthor[-secondauthor]-year-titleword1[-titleword2]
-        Example: smith-doe-2020-deep-vision
-
-        Args:
-            entry: Bibliography entry
-            existing_keys: Set of already used keys (to ensure uniqueness)
-
-        Returns:
-            Generated citation key
+    def generate_citation_key(
+        self,
+        entry: Dict,
+        existing_keys: Set[str],
+        citekey_format: str = "{author}-{year}-{title}",
+        entry_index: int = 1,
+    ) -> str:
+        """Generate a citation key for an entry using a user-defined format string.
+        Supported fields: {author}, {year}, {title}, {titleword}, {author2}, etc.
         """
         # Extract up to first two author surnames
         authors = self.extract_authors_lastname(entry.get('author', ''))
         clean_authors = [re.sub(r'[^a-z0-9]', '', a.lower()) for a in authors if a]
-        if clean_authors:
-            author_part = "-".join(clean_authors[:2])
-        else:
-            author_part = 'unknown'
+        author = clean_authors[0] if clean_authors else 'unknown'
+        author2 = clean_authors[1] if len(clean_authors) > 1 else ''
+        authorstem = self._professor_author_fragment(entry.get('author', ''))
+        authorstrict = self._strict_professor_author_fragment(entry.get('author', ''))
+        authoretal = self._author_etal_fragment(entry.get('author', ''))
+        lastname = self._lastname_year_fragment(entry.get('author', ''))
 
         # Extract 4-digit year if available
         year_raw = str(entry.get('year', '0000'))
@@ -395,24 +586,42 @@ class BibliographyManager:
         # Extract up to first two meaningful title words
         title = self.normalize_string(entry.get('title', ''))
         title_words = [w for w in title.split() if len(w) > 3]
-        if not title_words:
-            title_words = ['paper']
-        title_part = "-".join(title_words[:2])
+        titleword = title_words[0] if title_words else 'paper'
+        titleword2 = title_words[1] if len(title_words) > 1 else ''
+        title_part = "-".join(title_words[:2]) if title_words else 'paper'
+        authorinitials = ''.join(name[:1] for name in clean_authors[:3]) or 'unk'
+        numeric = str(entry_index)
 
-        # Construct base key
-        base_key = f"{author_part}-{year}-{title_part}"
-        
+        # Compose key using format string
+        key = citekey_format.format(
+            author=author,
+            author2=author2,
+            authorstem=authorstem,
+            authorstrict=authorstrict,
+            authoretal=authoretal,
+            lastname=lastname,
+            authorinitials=authorinitials,
+            year=year,
+            numeric=numeric,
+            title=title,
+            titleword=titleword,
+            titleword2=titleword2,
+            title_part=title_part
+        )
+
+        # Clean up double dashes, spaces, etc.
+        key = re.sub(r'[^a-z0-9\-]', '', key.lower().replace(' ', '-'))
+
         # Ensure uniqueness
-        key = base_key
+        base_key = key
         counter = 1
         while key in existing_keys:
-            key = f"{base_key}-{chr(96 + counter)}"  # append a, b, c, ...
+            key = f"{base_key}{chr(96 + counter)}"  # append a, b, c, ...
             counter += 1
-        
         return key
     
-    def fix_citation_keys(self):
-        """Regenerate citation keys with consistent naming scheme"""
+    def fix_citation_keys(self, citekey_format: str = "{author}-{year}-{title}"):
+        """Regenerate citation keys with user-defined naming scheme"""
         print(f"\n{'='*60}")
         print(f"STEP 3: Fixing citation keys (labels)...")
         print(f"{'='*60}\n")
@@ -420,13 +629,11 @@ class BibliographyManager:
         existing_keys = set()
         key_changes = []
         
-        for entry in self.all_entries:
+        for entry_index, entry in enumerate(self.all_entries, start=1):
             old_key = entry.get('ID', 'NO_ID')
-            new_key = self.generate_citation_key(entry, existing_keys)
-            
+            new_key = self.generate_citation_key(entry, existing_keys, citekey_format, entry_index)
             existing_keys.add(new_key)
             entry['ID'] = new_key
-            
             if old_key != new_key:
                 key_changes.append((old_key, new_key))
         
@@ -455,8 +662,14 @@ class BibliographyManager:
         if output_path is None:
             output_path = os.path.join(self.root_directory, 'master.bib')
         
-        # Prepare database
-        self.master_db.entries = self.all_entries
+        # Prepare database with cleaned entries (remove internal metadata fields)
+        cleaned_entries = []
+        for entry in self.all_entries:
+            cleaned = {k: v for k, v in entry.items() 
+                      if not k.startswith('_')}  # Remove all internal metadata fields
+            cleaned_entries.append(cleaned)
+        
+        self.master_db.entries = cleaned_entries
         
         # Write to file
         writer = BibTexWriter()
@@ -493,6 +706,9 @@ class BibliographyManager:
         # Get unique directories
         directories = set(bib_file.parent for bib_file in self.bib_files)
         master_path = Path(master_file).resolve()
+        mapping: Dict[str, str] = {}
+        if self.report_data.get('keys_changed'):
+            mapping = {old: new for old, new in self.report_data['keys_changed'] if old and new}
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -521,13 +737,10 @@ class BibliographyManager:
                 print(f"✓ Backed up .bib files from: {directory.relative_to(self.root_directory)}")
                 print(f"  → {backup_dir.relative_to(self.root_directory)}/")
 
-            # After creating backups, update citation keys in original files if we have mappings
-            if self.report_data.get('keys_changed'):
+            # After creating backups, update citation keys in original .bib files.
+            if mapping:
                 try:
-                    # Convert list of tuples to dict
-                    mapping = {old: new for old, new in self.report_data['keys_changed'] if old and new}
-                    if mapping:
-                        self._update_source_files_keys(directory, mapping)
+                    self._update_source_files_keys(directory, mapping)
                 except Exception:
                     # Non-fatal: continue even if updating sources fails
                     pass
@@ -546,8 +759,31 @@ class BibliographyManager:
                 shutil.copy2(master_file, dest_path)
             
             print(f"✓ Copied master.bib to: {directory.relative_to(self.root_directory)}/\n")
+
+        # Update LaTeX citations globally under root directory once.
+        if mapping:
+            try:
+                self._update_latex_citations(mapping)
+            except Exception:
+                # Non-fatal: keep pipeline successful even if tex rewrite fails
+                pass
         
         print(f"✓ Master bibliography distributed to {len(directories)} folder(s)\n")
+
+    def _compute_changed_lines(self, original_text: str, updated_text: str) -> List[int]:
+        """Return 1-based line numbers that changed between two texts."""
+        orig_lines = original_text.splitlines()
+        upd_lines = updated_text.splitlines()
+        max_lines = max(len(orig_lines), len(upd_lines))
+        changed_lines: List[int] = []
+
+        for i in range(max_lines):
+            o = orig_lines[i] if i < len(orig_lines) else ''
+            u = upd_lines[i] if i < len(upd_lines) else ''
+            if o != u:
+                changed_lines.append(i + 1)
+
+        return changed_lines
 
     def _update_source_files_keys(self, directory: Path, mapping: Dict[str, str]):
         """Update citation keys in all .bib files within `directory` according to mapping.
@@ -585,15 +821,7 @@ class BibliographyManager:
                 updated = updated_text != original_text
 
                 if updated:
-                    # Compute changed lines (1-based)
-                    orig_lines = original_text.splitlines()
-                    upd_lines = updated_text.splitlines()
-                    max_lines = max(len(orig_lines), len(upd_lines))
-                    for i in range(max_lines):
-                        o = orig_lines[i] if i < len(orig_lines) else ''
-                        u = upd_lines[i] if i < len(upd_lines) else ''
-                        if o != u:
-                            changed_lines.append(i + 1)
+                    changed_lines = self._compute_changed_lines(original_text, updated_text)
 
                     # Save to report mapping
                     relpath = str(bib_file.relative_to(self.root_directory))
@@ -613,6 +841,109 @@ class BibliographyManager:
 
         # Update report_data
         self.report_data['file_changes'] = file_changes
+
+    def _replace_citation_keys_in_tex(self, text: str, mapping: Dict[str, str]) -> Tuple[str, int]:
+        """Replace keys inside LaTeX cite-like commands while preserving options and spacing."""
+        cite_pattern = re.compile(r'\\([A-Za-z]*cite[A-Za-z*]*)(\s*(?:\[[^\]]*\]\s*)*)\{([^}]*)\}')
+        replacements = 0
+
+        def _replace_in_code_segment(segment: str) -> str:
+            nonlocal replacements
+
+            def _command_replacer(match):
+                nonlocal replacements
+                command = match.group(1)
+                opts = match.group(2)
+                key_blob = match.group(3)
+
+                updated_parts: List[str] = []
+                for part in key_blob.split(','):
+                    if not part:
+                        updated_parts.append(part)
+                        continue
+
+                    leading_ws = len(part) - len(part.lstrip())
+                    trailing_ws = len(part) - len(part.rstrip())
+                    core_key = part.strip()
+
+                    if core_key in mapping:
+                        new_key = mapping[core_key]
+                        if new_key != core_key:
+                            replacements += 1
+                        updated_parts.append(f"{' ' * leading_ws}{new_key}{' ' * trailing_ws}")
+                    else:
+                        updated_parts.append(part)
+
+                updated_blob = ','.join(updated_parts)
+                return f"\\{command}{opts}{{{updated_blob}}}"
+
+            return cite_pattern.sub(_command_replacer, segment)
+
+        updated_lines: List[str] = []
+        for line in text.splitlines(keepends=True):
+            # Preserve full-line comments untouched.
+            if re.match(r'^\s*%', line):
+                updated_lines.append(line)
+                continue
+
+            # Split at first unescaped '%' so trailing comments remain untouched.
+            split_at = -1
+            escaped = False
+            for idx, ch in enumerate(line):
+                if ch == '\\' and not escaped:
+                    escaped = True
+                    continue
+                if ch == '%' and not escaped:
+                    split_at = idx
+                    break
+                escaped = False
+
+            if split_at >= 0:
+                code_part = line[:split_at]
+                comment_part = line[split_at:]
+                updated_lines.append(_replace_in_code_segment(code_part) + comment_part)
+            else:
+                updated_lines.append(_replace_in_code_segment(line))
+
+        return ''.join(updated_lines), replacements
+
+    def _update_latex_citations(self, mapping: Dict[str, str]):
+        """Update citation keys in all .tex files under root directory."""
+        file_changes: Dict[str, Dict] = self.report_data.get('file_changes', {})
+        tex_files_updated = 0
+        tex_citation_updates = 0
+
+        for tex_file in Path(self.root_directory).rglob('*.tex'):
+            if any(part.startswith('backup_') for part in tex_file.parts):
+                continue
+
+            try:
+                with open(tex_file, encoding='utf-8') as f:
+                    original_text = f.read()
+
+                updated_text, replaced_count = self._replace_citation_keys_in_tex(original_text, mapping)
+                if updated_text == original_text:
+                    continue
+
+                changed_lines = self._compute_changed_lines(original_text, updated_text)
+                relpath = str(tex_file.relative_to(self.root_directory))
+                file_changes[relpath] = {
+                    'original': original_text,
+                    'updated': updated_text,
+                    'changed_lines': changed_lines,
+                }
+
+                with open(tex_file, 'w', encoding='utf-8') as f:
+                    f.write(updated_text)
+
+                tex_files_updated += 1
+                tex_citation_updates += replaced_count
+            except Exception:
+                continue
+
+        self.report_data['file_changes'] = file_changes
+        self.report_data['tex_files_updated'] = tex_files_updated
+        self.report_data['tex_citation_updates'] = tex_citation_updates
     
     def generate_html_report(self, output_path: str | None = None) -> str:
         """Generate a detailed HTML report of the processing
@@ -852,6 +1183,7 @@ class BibliographyManager:
                     and removed <strong>{self.report_data['duplicates_removed']}</strong> redundant entries, 
                     resulting in <strong>{self.report_data['final_entries']}</strong> unique citations.
                     {f"Normalized <strong>{len(self.report_data['keys_changed'])}</strong> citation keys for consistency." if self.report_data['keys_changed'] else ""}
+                    {f" Updated <strong>{self.report_data['tex_citation_updates']}</strong> LaTeX citation references across <strong>{self.report_data['tex_files_updated']}</strong> .tex file(s)." if self.report_data.get('tex_citation_updates') else ""}
                 </p>
                 <p style="margin-top: 15px;">
                     <span class="success-rate">
