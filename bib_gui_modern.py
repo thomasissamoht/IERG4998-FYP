@@ -7,6 +7,7 @@ Using CustomTkinter for a beautiful, modern interface
 import customtkinter as ctk
 import threading
 import webbrowser
+import difflib
 from pathlib import Path
 from typing import Optional
 from bib import BibliographyManager
@@ -16,6 +17,8 @@ import tempfile
 import zipfile
 import shutil
 import os
+import tkinter as tk
+from tkinter import ttk
 from tkinter import filedialog
 from tkinter import messagebox
 
@@ -52,7 +55,10 @@ class ModernBibGUI:
         self._syncing_scroll = False
         self._syncing_scroll_x = False
         self._current_changed_lines = []
+        self._current_changed_display_lines = []
         self._current_changed_idx = -1
+        self._show_unchanged_var = ctk.BooleanVar(value=True)
+        self._diff_context_lines = 2
         self._last_master_path = None
         self._last_cleaned_zip = None
         self._status_text = ctk.StringVar(value="Ready")
@@ -73,6 +79,24 @@ class ModernBibGUI:
         self._duplicate_highlight_positions = []
         self._selected_duplicate_highlight = 0
         self._current_duplicate_display_name = "-"
+        self._library_entries = []
+        self._library_filtered_entries = []
+        self._library_scope = "All References"
+        self._library_scope_buttons = {}
+        self._custom_collections: dict[str, set[str]] = {}
+        self._active_collection_name: Optional[str] = None
+        self._library_notes: dict[str, str] = {}
+        self._library_tags: dict[str, str] = {}
+        self._selected_library_key: str = ""
+        self._selected_library_entry = None
+        self.library_context_menu = None
+        self._library_tree_style_name = "Library.Treeview"
+        self._library_density_var = ctk.StringVar(value="Compact")
+        # Legacy placeholders for previously split fixes view helpers.
+        self.orig_text = None
+        self.updated_text = None
+        self.fixes_scrollbar = None
+        self.fixes_h_scrollbar = None
         
         # Citation key normalization rule (default and custom)
         self.citekey_rule_var = ctk.StringVar(value="author-year-title")
@@ -92,6 +116,7 @@ class ModernBibGUI:
     def _build_ui(self):
         """Build the user interface"""
         # Configure grid
+        self.root.grid_columnconfigure(0, weight=0)
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
         
@@ -102,228 +127,257 @@ class ModernBibGUI:
         self._build_main_content()
         
     def _build_sidebar(self):
-    # Citation key normalization rule (default and custom)
+        """Build a reference-manager style control rail."""
+        sidebar = ctk.CTkFrame(self.root, width=320, corner_radius=0, fg_color="#101218")
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(5, weight=1)
 
-                        # Citation key normalization rule
+        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 12))
+        brand.grid_columnconfigure(0, weight=1)
 
-                # Citation key normalization rule
+        ctk.CTkLabel(
+            brand,
+            text="Bibliography Workspace",
+            font=ctk.CTkFont(size=19, weight="bold")
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            brand,
+            text="Collect, deduplicate, normalize, and export in one flow",
+            font=ctk.CTkFont(size=11),
+            text_color="#8f99ab"
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        """Build left sidebar with controls"""
-        sidebar = ctk.CTkFrame(self.root, width=300, corner_radius=0)
-        sidebar.grid(row=0, column=0, rowspan=4, sticky="nsew")
-        sidebar.grid_rowconfigure(6, weight=1)
-        
-        # Logo/Title
-        logo_label = ctk.CTkLabel(
-            sidebar, 
-            text="📚 BibTeX Manager",
-            font=ctk.CTkFont(size=24, weight="bold")
+        workspace_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
+        workspace_card.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        workspace_card.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(workspace_card, text="Project Source", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 6)
         )
-        logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
-        
-        subtitle = ctk.CTkLabel(
-            sidebar,
-            text="Modern Bibliography Tool",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        subtitle.grid(row=1, column=0, padx=20, pady=(0, 20))
-        
-        # Directory selection
-        dir_label = ctk.CTkLabel(sidebar, text="Select Directory", font=ctk.CTkFont(size=14, weight="bold"))
-        dir_label.grid(row=2, column=0, padx=20, pady=(10, 5), sticky="w")
-        
-        self.dir_entry = ctk.CTkEntry(sidebar, placeholder_text="Choose folder or .zip with .bib files...")
-        self.dir_entry.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
-        
+
+        self.dir_entry = ctk.CTkEntry(workspace_card, placeholder_text="Choose folder or .zip with .bib files...")
+        self.dir_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+
         self.browse_btn = ctk.CTkButton(
-            sidebar,
-            text="📁 Browse",
+            workspace_card,
+            text="Browse",
             command=self._browse_directory,
-            fg_color="gray25",
-            hover_color="gray30"
+            height=30,
+            fg_color="#2b3447",
+            hover_color="#34405a"
         )
-        self.browse_btn.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="ew")
-
-        quick_actions = ctk.CTkFrame(sidebar, fg_color="transparent")
-        quick_actions.grid(row=5, column=0, padx=20, pady=(0, 8), sticky="ew")
-        quick_actions.grid_columnconfigure((0, 1), weight=1)
+        self.browse_btn.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
 
         self.demo_btn = ctk.CTkButton(
-            quick_actions,
-            text="🧪 Use test_data",
+            workspace_card,
+            text="Use test_data",
             command=self._use_test_data,
             height=28,
-            fg_color="gray25",
+            fg_color="gray23",
             hover_color="gray30"
         )
-        self.demo_btn.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.demo_btn.grid(row=3, column=0, sticky="ew", padx=(12, 6), pady=(0, 10))
 
         self.clear_btn = ctk.CTkButton(
-            quick_actions,
-            text="🧹 Clear",
+            workspace_card,
+            text="Clear",
             command=self._clear_for_next_run,
             height=28,
-            fg_color="gray25",
+            fg_color="gray23",
             hover_color="gray30"
         )
-        self.clear_btn.grid(row=0, column=1, padx=(5, 0), sticky="ew")
-        
-        # Similarity threshold slider
-        threshold_label = ctk.CTkLabel(
-            sidebar, 
-            text="Similarity Threshold",
-            font=ctk.CTkFont(size=14, weight="bold")
+        self.clear_btn.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=(0, 10))
+
+        options_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
+        options_card.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+        options_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(options_card, text="Pipeline Options", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 6)
         )
-        threshold_label.grid(row=6, column=0, padx=20, pady=(10, 5), sticky="w")
-        
+
+        row = ctk.CTkFrame(options_card, fg_color="transparent")
+        row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 0))
+        row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(row, text="Duplicate Similarity", font=ctk.CTkFont(size=11), text_color="#d2d8e5").grid(row=0, column=0, sticky="w")
+
         self.threshold_var = ctk.IntVar(value=85)
-        self.threshold_label = ctk.CTkLabel(sidebar, text="85%", text_color="#3b8ed0")
-        self.threshold_label.grid(row=7, column=0, padx=20, pady=0)
-        
-        self.threshold_hint = ctk.CTkLabel(
-            sidebar,
-            text="Balanced (recommended)",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.threshold_hint.grid(row=8, column=0, padx=20, pady=(0, 4))
-        
+        self.threshold_label = ctk.CTkLabel(row, text="85%", text_color="#66b3ff", font=ctk.CTkFont(size=11, weight="bold"))
+        self.threshold_label.grid(row=0, column=1, sticky="e")
+
         self.threshold_slider = ctk.CTkSlider(
-            sidebar,
+            options_card,
             from_=0,
             to=100,
             variable=self.threshold_var,
             command=self._update_threshold_label
         )
-        self.threshold_slider.grid(row=9, column=0, padx=20, pady=(5, 20), sticky="ew")
-        
-        self.push_var = ctk.BooleanVar(value=True)
-        self.push_check = ctk.CTkCheckBox(
-            sidebar,
-            text="Push master.bib to folders",
-            variable=self.push_var,
-            font=ctk.CTkFont(size=13)
-        )
-        self.push_check.grid(row=10, column=0, padx=20, pady=5, sticky="w")
-        
-        self.report_var = ctk.BooleanVar(value=True)
-        self.report_check = ctk.CTkCheckBox(
-            sidebar,
-            text="Generate HTML report",
-            variable=self.report_var,
-            font=ctk.CTkFont(size=13)
-        )
-        self.report_check.grid(row=11, column=0, padx=20, pady=5, sticky="w")
+        self.threshold_slider.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 2))
 
-        self.status_label = ctk.CTkLabel(
-            sidebar,
-            textvariable=self._status_text,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#3b8ed0"
+        self.threshold_hint = ctk.CTkLabel(
+            options_card,
+            text="Balanced (recommended)",
+            font=ctk.CTkFont(size=10),
+            text_color="#7f8ba1"
         )
-        self.status_label.grid(row=12, column=0, padx=20, pady=(6, 0), sticky="w")
-        
-        # Action buttons
-        self.run_btn = ctk.CTkButton(
-            sidebar,
-            text="▶ Run Pipeline",
-            command=self._run_pipeline,
-            height=45,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#1f538d",
-            hover_color="#14375e"
+        self.threshold_hint.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 8))
+
+        self.push_var = ctk.BooleanVar(value=True)
+        self.push_check = ctk.CTkCheckBox(options_card, text="Distribute master.bib to project folders", variable=self.push_var)
+        self.push_check.grid(row=4, column=0, sticky="w", padx=12, pady=(0, 4))
+
+        self.report_var = ctk.BooleanVar(value=True)
+        self.report_check = ctk.CTkCheckBox(options_card, text="Generate HTML report", variable=self.report_var)
+        self.report_check.grid(row=5, column=0, sticky="w", padx=12, pady=(0, 10))
+
+        keys_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
+        keys_card.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 10))
+        keys_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(keys_card, text="Citation Key Policy", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 6)
         )
-        self.run_btn.grid(row=13, column=0, padx=20, pady=(30, 10), sticky="ew")
-        
-        self.cancel_btn = ctk.CTkButton(
-            sidebar,
-            text="⏹ Cancel",
-            command=self._cancel_pipeline,
-            height=35,
-            fg_color="gray25",
-            hover_color="gray30",
-            state="disabled"
-        )
-        self.cancel_btn.grid(row=14, column=0, padx=20, pady=5, sticky="ew")
-        
-        self.view_report_btn = ctk.CTkButton(
-            sidebar,
-            text="📊 View Report",
-            command=self._view_report,
-            height=35,
-            fg_color="gray25",
-            hover_color="gray30",
-            state="disabled"
-        )
-        self.view_report_btn.grid(row=15, column=0, padx=20, pady=5, sticky="ew")
-        
-        # Citation key normalization rule UI
-        rule_label = ctk.CTkLabel(sidebar, text="Citation Key Rule", font=ctk.CTkFont(size=14, weight="bold"))
-        rule_label.grid(row=17, column=0, padx=20, pady=(18, 5), sticky="w")
 
         self.citekey_rule_menu = ctk.CTkOptionMenu(
-            sidebar,
+            keys_card,
             values=["author-year-title", "author-year-titleword", "author-title", "professor-style", "professor-strict", "author-et-al-year", "lastname-only-year", "firstauthor-year-titleword", "compact-initials", "numeric", "custom"],
             variable=self.citekey_rule_var,
             command=self._on_citekey_rule_changed,
-            fg_color="gray25",
-            button_color="gray30",
+            fg_color="#2b3447",
+            button_color="#34405a",
         )
-        self.citekey_rule_menu.grid(row=18, column=0, padx=20, pady=(0, 4), sticky="ew")
+        self.citekey_rule_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
         self.citekey_rule_menu.set("author-year-title")
 
         self.citekey_custom_entry = ctk.CTkEntry(
-            sidebar,
+            keys_card,
             textvariable=self.citekey_custom_var,
-            placeholder_text="e.g. {author}-{year}-{title}",
+            placeholder_text="Custom pattern, e.g. {author}{year}{titleword}",
             state="disabled"
         )
-        self.citekey_custom_entry.grid(row=19, column=0, padx=20, pady=(0, 8), sticky="ew")
+        self.citekey_custom_entry.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
 
-        citekey_hint = ctk.CTkLabel(
-            sidebar,
-            text="Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {authorinitials}, {year}, {titleword}, {numeric}",
-            wraplength=220,
+        ctk.CTkLabel(
+            keys_card,
+            text="Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {lastname}, {authorinitials}, {year}, {titleword}, {numeric}",
+            wraplength=274,
             justify="left",
-            text_color="gray70",
-            font=ctk.CTkFont(size=11)
+            text_color="#7f8ba1",
+            font=ctk.CTkFont(size=10),
+        ).grid(row=3, column=0, padx=12, pady=(0, 10), sticky="w")
+
+        actions_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
+        actions_card.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 10))
+        actions_card.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            actions_card,
+            textvariable=self._status_text,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#6ab8ff",
         )
-        citekey_hint.grid(row=20, column=0, padx=20, pady=(0, 8), sticky="w")
+        self.status_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
 
-        # Appearance mode switch (move to bottom)
-        appearance_label = ctk.CTkLabel(sidebar, text="Appearance Mode", font=ctk.CTkFont(size=12))
-        appearance_label.grid(row=21, column=0, padx=20, pady=(22, 5))
+        self.run_btn = ctk.CTkButton(
+            actions_card,
+            text="Run Full Pipeline",
+            command=self._run_pipeline,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#2878ff",
+            hover_color="#1f5fcb"
+        )
+        self.run_btn.grid(row=1, column=0, padx=12, pady=(0, 6), sticky="ew")
 
+        self.cancel_btn = ctk.CTkButton(
+            actions_card,
+            text="Cancel",
+            command=self._cancel_pipeline,
+            height=30,
+            fg_color="gray25",
+            hover_color="gray30",
+            state="disabled"
+        )
+        self.cancel_btn.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
+
+        self.view_report_btn = ctk.CTkButton(
+            actions_card,
+            text="Open Report",
+            command=self._view_report,
+            height=30,
+            fg_color="gray25",
+            hover_color="gray30",
+            state="disabled"
+        )
+        self.view_report_btn.grid(row=3, column=0, padx=12, pady=(0, 10), sticky="ew")
+
+        footer = ctk.CTkFrame(sidebar, fg_color="transparent")
+        footer.grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 14))
+        footer.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(footer, text="Appearance", font=ctk.CTkFont(size=11), text_color="#8f99ab").grid(
+            row=0, column=0, sticky="w", padx=2, pady=(0, 4)
+        )
         self.appearance_menu = ctk.CTkOptionMenu(
-            sidebar,
+            footer,
             values=["System", "Light", "Dark"],
             command=self._change_appearance,
             fg_color="gray25",
             button_color="gray30"
         )
-        self.appearance_menu.grid(row=22, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.appearance_menu.grid(row=1, column=0, sticky="ew")
         self.appearance_menu.set("Dark")
         
     def _build_main_content(self):
-        """Build main content area with tabs"""
-        # Main frame
-        main_frame = ctk.CTkFrame(self.root)
-        main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
-        main_frame.grid_rowconfigure(0, weight=1)
+        """Build main content area with reference-manager style header and tabs."""
+        main_frame = ctk.CTkFrame(self.root, fg_color="#0f1218")
+        main_frame.grid(row=0, column=1, sticky="nsew", padx=(14, 14), pady=14)
+        main_frame.grid_rowconfigure(1, weight=1)
         main_frame.grid_columnconfigure(0, weight=1)
-        
-        # Tab view
+
+        header = ctk.CTkFrame(main_frame, fg_color="#161b24", border_width=1, border_color="#222938")
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 10))
+        header.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            header,
+            text="All References Workspace",
+            font=ctk.CTkFont(size=17, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            header,
+            text="Track pipeline progress, inspect duplicates, and verify fixes before export",
+            font=ctk.CTkFont(size=11),
+            text_color="#8f99ab"
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+
+        self.top_status_badge = ctk.CTkLabel(
+            header,
+            textvariable=self._status_text,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#1f2937",
+            text_color="#93c5fd",
+            corner_radius=8,
+            padx=10,
+            pady=6,
+        )
+        self.top_status_badge.grid(row=0, column=1, rowspan=2, sticky="e", padx=12, pady=8)
+
         self.tabview = ctk.CTkTabview(main_frame, corner_radius=10)
-        self.tabview.grid(row=0, column=0, sticky="nsew")
+        self.tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         
         # Create tabs
+        self.tabview.add("📚 Library")
         self.tabview.add("📋 Pipeline")
         self.tabview.add("📊 Results")
         self.tabview.add("🔍 Duplicates")
         self.tabview.add("🛠 Fixes")
         self.tabview.add("ℹ️ About")
         
+        self._build_library_tab()
         self._build_pipeline_tab()
         self._build_results_tab()
         self._build_duplicates_tab()
@@ -355,6 +409,821 @@ class ModernBibGUI:
 
         self._update_duplicates()
         self._pending_duplicates_refresh = False
+
+    def _build_library_tab(self):
+        """Build a reference-manager style three-pane library workspace."""
+        tab = self.tabview.tab("📚 Library")
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=3)
+        tab.grid_columnconfigure(2, weight=2)
+
+        left = ctk.CTkFrame(tab, fg_color="#141922")
+        left.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=10)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Library", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 8)
+        )
+
+        scopes = ["All References", "Recently Added", "Favorites", "Duplicate Items"]
+        for idx, scope in enumerate(scopes, start=1):
+            btn = ctk.CTkButton(
+                left,
+                text=scope,
+                height=30,
+                fg_color="transparent",
+                hover_color="#263247",
+                anchor="w",
+                command=lambda s=scope: self._set_library_scope(s),
+            )
+            btn.grid(row=idx, column=0, sticky="ew", padx=8, pady=2)
+            self._library_scope_buttons[scope] = btn
+
+        ctk.CTkLabel(
+            left,
+            text="Tip: run pipeline first, then browse entries here.",
+            text_color="#8693aa",
+            font=ctk.CTkFont(size=10),
+            wraplength=180,
+            justify="left",
+        ).grid(row=6, column=0, sticky="w", padx=10, pady=(12, 10))
+
+        ctk.CTkLabel(left, text="Collections", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=7, column=0, sticky="w", padx=10, pady=(6, 4)
+        )
+        collection_row = ctk.CTkFrame(left, fg_color="transparent")
+        collection_row.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 4))
+        collection_row.grid_columnconfigure(0, weight=1)
+
+        self.collection_name_var = ctk.StringVar(value="")
+        self.collection_entry = ctk.CTkEntry(collection_row, textvariable=self.collection_name_var, placeholder_text="New collection")
+        self.collection_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.collection_add_btn = ctk.CTkButton(collection_row, text="Add", width=50, height=28, command=self._add_collection)
+        self.collection_add_btn.grid(row=0, column=1, sticky="e")
+
+        self.collection_menu = ctk.CTkOptionMenu(
+            left,
+            values=["No collections"],
+            command=self._on_collection_selected,
+            fg_color="gray23",
+            button_color="gray30",
+        )
+        self.collection_menu.grid(row=9, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self.collection_menu.set("No collections")
+
+        collection_actions = ctk.CTkFrame(left, fg_color="transparent")
+        collection_actions.grid(row=10, column=0, sticky="ew", padx=8, pady=(0, 10))
+        collection_actions.grid_columnconfigure((0, 1), weight=1)
+        self.add_to_collection_btn = ctk.CTkButton(
+            collection_actions,
+            text="Add selected",
+            height=28,
+            fg_color="gray23",
+            hover_color="gray30",
+            command=self._add_selected_to_active_collection,
+        )
+        self.add_to_collection_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.remove_collection_btn = ctk.CTkButton(
+            collection_actions,
+            text="Remove",
+            height=28,
+            fg_color="gray23",
+            hover_color="gray30",
+            command=self._remove_active_collection,
+        )
+        self.remove_collection_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        center = ctk.CTkFrame(tab, fg_color="#141922")
+        center.grid(row=0, column=1, sticky="nsew", padx=(0, 6), pady=10)
+        center.grid_rowconfigure(1, weight=1)
+        center.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(center, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        top.grid_columnconfigure(1, weight=1)
+        top.grid_columnconfigure(2, weight=0)
+
+        ctk.CTkLabel(top, text="All References", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+
+        self.library_search_var = ctk.StringVar(value="")
+        search_entry = ctk.CTkEntry(top, textvariable=self.library_search_var, placeholder_text="Search title, author, year, key...")
+        search_entry.grid(row=0, column=1, sticky="ew")
+        search_entry.bind("<KeyRelease>", lambda _e: self._apply_library_filter())
+
+        toolbar = ctk.CTkFrame(top, fg_color="transparent")
+        toolbar.grid(row=0, column=2, padx=(8, 0), sticky="e")
+
+        self.library_add_btn = ctk.CTkButton(toolbar, text="Add", width=58, height=28, command=self._add_library_entry_manual)
+        self.library_add_btn.grid(row=0, column=0, padx=(0, 4))
+        self.library_delete_btn = ctk.CTkButton(toolbar, text="Delete", width=58, height=28, fg_color="gray23", hover_color="gray30", command=self._delete_selected_library_entry)
+        self.library_delete_btn.grid(row=0, column=1, padx=(0, 4))
+        self.library_export_btn = ctk.CTkButton(toolbar, text="Export", width=62, height=28, fg_color="gray23", hover_color="gray30", command=self._export_selected_library_entry)
+        self.library_export_btn.grid(row=0, column=2, padx=(0, 6))
+
+        self.library_density_menu = ctk.CTkOptionMenu(
+            toolbar,
+            values=["Compact", "Comfortable"],
+            variable=self._library_density_var,
+            command=self._change_library_density,
+            width=116,
+            fg_color="gray23",
+            button_color="gray30",
+        )
+        self.library_density_menu.grid(row=0, column=3)
+
+        filters = ctk.CTkFrame(center, fg_color="transparent")
+        filters.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self.filter_duplicates_var = ctk.BooleanVar(value=False)
+        self.filter_doi_var = ctk.BooleanVar(value=False)
+        self.filter_missing_year_var = ctk.BooleanVar(value=False)
+
+        self.filter_duplicates_chip = ctk.CTkCheckBox(
+            filters,
+            text="Duplicates",
+            variable=self.filter_duplicates_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._apply_library_filter,
+        )
+        self.filter_duplicates_chip.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="w")
+
+        self.filter_doi_chip = ctk.CTkCheckBox(
+            filters,
+            text="Has DOI",
+            variable=self.filter_doi_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._apply_library_filter,
+        )
+        self.filter_doi_chip.grid(row=0, column=1, padx=(0, 8), pady=0, sticky="w")
+
+        self.filter_missing_year_chip = ctk.CTkCheckBox(
+            filters,
+            text="Missing Year",
+            variable=self.filter_missing_year_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._apply_library_filter,
+        )
+        self.filter_missing_year_chip.grid(row=0, column=2, padx=(0, 8), pady=0, sticky="w")
+
+        tree_frame = ctk.CTkFrame(center, fg_color="#10151d")
+        tree_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("default")
+        except Exception:
+            pass
+        style.configure(
+            self._library_tree_style_name,
+            background="#111826",
+            foreground="#dbe4f5",
+            fieldbackground="#111826",
+            rowheight=26,
+            borderwidth=0,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Library.Treeview.Heading",
+            background="#1a2333",
+            foreground="#c6d4ec",
+            relief="flat",
+            borderwidth=0,
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            self._library_tree_style_name,
+            background=[("selected", "#264976")],
+            foreground=[("selected", "#ffffff")],
+        )
+
+        self.library_tree = ttk.Treeview(
+            tree_frame,
+            columns=("status", "authors", "year", "title", "source", "key"),
+            show="headings",
+            selectmode="browse",
+            height=20,
+            style=self._library_tree_style_name,
+        )
+        self.library_tree.heading("status", text="★", command=lambda: self._sort_library_tree("status", False))
+        self.library_tree.heading("authors", text="Authors", command=lambda: self._sort_library_tree("authors", False))
+        self.library_tree.heading("year", text="Year", command=lambda: self._sort_library_tree("year", True))
+        self.library_tree.heading("title", text="Title", command=lambda: self._sort_library_tree("title", False))
+        self.library_tree.heading("source", text="Source", command=lambda: self._sort_library_tree("source", False))
+        self.library_tree.heading("key", text="Key", command=lambda: self._sort_library_tree("key", False))
+        self.library_tree.column("status", width=44, anchor="center")
+        self.library_tree.column("authors", width=220, anchor="w")
+        self.library_tree.column("year", width=60, anchor="center")
+        self.library_tree.column("title", width=420, anchor="w")
+        self.library_tree.column("source", width=150, anchor="w")
+        self.library_tree.column("key", width=150, anchor="w")
+
+        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.library_tree.yview)
+        x_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.library_tree.xview)
+        self.library_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.library_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.library_tree.bind("<<TreeviewSelect>>", self._on_library_row_selected)
+        self.library_tree.bind("<Double-1>", self._toggle_selected_favorite)
+        self.library_tree.bind("<ButtonRelease-1>", self._on_library_tree_click)
+        self.library_tree.bind("<Button-3>", self._show_library_context_menu)
+        self._bind_library_shortcuts(search_entry)
+
+        right = ctk.CTkFrame(tab, fg_color="#141922")
+        right.grid(row=0, column=2, sticky="nsew", padx=(0, 10), pady=10)
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(right, text="Details", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 8)
+        )
+
+        detail_actions = ctk.CTkFrame(right, fg_color="transparent")
+        detail_actions.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        detail_actions.grid_columnconfigure((0, 1, 2), weight=1)
+
+        self.copy_key_btn = ctk.CTkButton(
+            detail_actions,
+            text="Copy Key (Ctrl+C)",
+            height=28,
+            fg_color="gray23",
+            hover_color="gray30",
+            command=self._copy_selected_key,
+        )
+        self.copy_key_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.add_selected_btn = ctk.CTkButton(
+            detail_actions,
+            text="Add to Collection",
+            height=28,
+            fg_color="gray23",
+            hover_color="gray30",
+            command=self._add_selected_to_active_collection,
+        )
+        self.add_selected_btn.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+
+        self.review_duplicate_btn = ctk.CTkButton(
+            detail_actions,
+            text="Review Duplicates",
+            height=28,
+            fg_color="gray23",
+            hover_color="gray30",
+            command=self._review_selected_duplicates,
+        )
+        self.review_duplicate_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self.library_details_tabs = ctk.CTkTabview(right)
+        self.library_details_tabs.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.library_details_tabs.add("Info")
+        self.library_details_tabs.add("Notes")
+        self.library_details_tabs.add("Tags")
+
+        info_tab = self.library_details_tabs.tab("Info")
+        info_tab.grid_rowconfigure(0, weight=1)
+        info_tab.grid_rowconfigure(1, weight=0)
+        info_tab.grid_columnconfigure(0, weight=1)
+        self.library_info_text = ctk.CTkTextbox(info_tab, font=ctk.CTkFont(family="Consolas", size=11), wrap="word")
+        self.library_info_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.library_info_text.insert("1.0", "Run pipeline, then select a reference to view metadata.")
+
+        edit_box = ctk.CTkFrame(info_tab, fg_color="#10151d")
+        edit_box.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        for col in range(4):
+            edit_box.grid_columnconfigure(col, weight=1)
+
+        self.meta_author_var = ctk.StringVar(value="")
+        self.meta_year_var = ctk.StringVar(value="")
+        self.meta_title_var = ctk.StringVar(value="")
+        self.meta_source_var = ctk.StringVar(value="")
+        self.meta_doi_var = ctk.StringVar(value="")
+
+        ctk.CTkLabel(edit_box, text="Author", font=ctk.CTkFont(size=10)).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
+        ctk.CTkLabel(edit_box, text="Year", font=ctk.CTkFont(size=10)).grid(row=0, column=1, sticky="w", padx=6, pady=(6, 0))
+        ctk.CTkLabel(edit_box, text="Source", font=ctk.CTkFont(size=10)).grid(row=0, column=2, sticky="w", padx=6, pady=(6, 0))
+        ctk.CTkLabel(edit_box, text="DOI", font=ctk.CTkFont(size=10)).grid(row=0, column=3, sticky="w", padx=6, pady=(6, 0))
+
+        ctk.CTkEntry(edit_box, textvariable=self.meta_author_var).grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        ctk.CTkEntry(edit_box, textvariable=self.meta_year_var).grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 4))
+        ctk.CTkEntry(edit_box, textvariable=self.meta_source_var).grid(row=1, column=2, sticky="ew", padx=6, pady=(0, 4))
+        ctk.CTkEntry(edit_box, textvariable=self.meta_doi_var).grid(row=1, column=3, sticky="ew", padx=6, pady=(0, 4))
+
+        ctk.CTkLabel(edit_box, text="Title", font=ctk.CTkFont(size=10)).grid(row=2, column=0, sticky="w", padx=6, pady=(0, 0))
+        ctk.CTkEntry(edit_box, textvariable=self.meta_title_var).grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
+        self.meta_save_btn = ctk.CTkButton(edit_box, text="Save Metadata", height=26, command=self._save_selected_metadata)
+        self.meta_save_btn.grid(row=3, column=3, sticky="ew", padx=6, pady=(0, 6))
+
+        notes_tab = self.library_details_tabs.tab("Notes")
+        notes_tab.grid_rowconfigure(0, weight=1)
+        notes_tab.grid_columnconfigure(0, weight=1)
+        self.library_notes_text = ctk.CTkTextbox(notes_tab, font=ctk.CTkFont(size=11), wrap="word")
+        self.library_notes_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
+        self.library_note_save_btn = ctk.CTkButton(notes_tab, text="Save Note", height=26, command=self._save_selected_note)
+        self.library_note_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
+
+        tags_tab = self.library_details_tabs.tab("Tags")
+        tags_tab.grid_rowconfigure(0, weight=1)
+        tags_tab.grid_columnconfigure(0, weight=1)
+        self.library_tags_text = ctk.CTkTextbox(tags_tab, font=ctk.CTkFont(size=11), wrap="word")
+        self.library_tags_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
+        self.library_tag_save_btn = ctk.CTkButton(tags_tab, text="Save Tags", height=26, command=self._save_selected_tags)
+        self.library_tag_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
+
+        self._update_library_scope_buttons()
+
+    def _set_library_scope(self, scope: str):
+        self._library_scope = scope
+        self._active_collection_name = None
+        self._update_library_scope_buttons()
+        self._apply_library_filter()
+
+    def _update_library_scope_buttons(self):
+        counts = self._library_scope_counts()
+        for scope, btn in self._library_scope_buttons.items():
+            active = scope == self._library_scope
+            count = counts.get(scope, 0)
+            btn.configure(
+                text=f"{scope} ({count})",
+                fg_color="#2b3a54" if active else "transparent",
+                text_color="#dbeafe" if active else "#c8d0df",
+            )
+
+    def _library_scope_counts(self) -> dict[str, int]:
+        entries = self._library_entries
+        duplicate_keys = set()
+        if self.manager:
+            for group in self.manager.report_data.get('duplicate_groups', []):
+                for entry in group.get('entries', []):
+                    key = str(entry.get('ID', '')).strip()
+                    if key:
+                        duplicate_keys.add(key)
+        return {
+            "All References": len(entries),
+            "Recently Added": min(len(entries), 200),
+            "Favorites": sum(1 for e in entries if e.get('_favorite')),
+            "Duplicate Items": sum(1 for e in entries if str(e.get('ID', '')).strip() in duplicate_keys),
+        }
+
+    def _refresh_collection_menu(self):
+        if not hasattr(self, 'collection_menu'):
+            return
+        names = sorted(self._custom_collections.keys())
+        if not names:
+            self.collection_menu.configure(values=["No collections"])
+            self.collection_menu.set("No collections")
+            return
+        self.collection_menu.configure(values=names)
+        current = self._active_collection_name if self._active_collection_name in names else names[0]
+        self._active_collection_name = current
+        self.collection_menu.set(current)
+
+    def _add_collection(self):
+        name = (self.collection_name_var.get() if hasattr(self, 'collection_name_var') else "").strip()
+        if not name:
+            return
+        if name not in self._custom_collections:
+            self._custom_collections[name] = set()
+        self._active_collection_name = name
+        self._refresh_collection_menu()
+        self.collection_name_var.set("")
+
+    def _on_collection_selected(self, selection: str):
+        if selection == "No collections":
+            self._active_collection_name = None
+            self._set_library_scope("All References")
+            return
+        if selection in self._custom_collections:
+            self._active_collection_name = selection
+            self._library_scope = "Collection"
+            self._update_library_scope_buttons()
+            self._apply_library_filter()
+
+    def _remove_active_collection(self):
+        if not self._active_collection_name:
+            return
+        self._custom_collections.pop(self._active_collection_name, None)
+        self._active_collection_name = None
+        self._refresh_collection_menu()
+        self._set_library_scope("All References")
+
+    def _get_selected_library_entry(self):
+        if not hasattr(self, 'library_tree'):
+            return None
+        selected = self.library_tree.selection()
+        if not selected:
+            return None
+        try:
+            idx = int(selected[0])
+        except Exception:
+            return None
+        if idx < 0 or idx >= len(self._library_filtered_entries):
+            return None
+        return self._library_filtered_entries[idx]
+
+    def _add_selected_to_active_collection(self):
+        if not self._active_collection_name or self._active_collection_name not in self._custom_collections:
+            return
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            return
+        self._custom_collections[self._active_collection_name].add(key)
+        if self._library_scope == "Collection":
+            self._apply_library_filter()
+
+    def _change_library_density(self, mode: str):
+        """Switch table row density between compact and comfortable."""
+        row_height = 26 if mode == "Compact" else 34
+        style = ttk.Style()
+        style.configure(self._library_tree_style_name, rowheight=row_height)
+
+    def _bind_library_shortcuts(self, search_entry):
+        """Bind keyboard shortcuts for fast library navigation and actions."""
+        self.root.bind_all('<Control-f>', lambda e: self._focus_library_search(search_entry))
+        self.root.bind_all('<Control-d>', lambda e: self._delete_selected_library_entry())
+        self.root.bind_all('<Control-c>', lambda e: self._copy_selected_key())
+        self.root.bind_all('<Control-m>', lambda e: self._toggle_selected_favorite())
+
+    def _focus_library_search(self, search_entry):
+        try:
+            search_entry.focus_set()
+            search_entry.icursor('end')
+        except Exception:
+            pass
+
+    def _add_library_entry_manual(self):
+        """Quick-add a placeholder entry to speed manual curation demos."""
+        new_entry = {
+            'ID': f"new{len(self._library_entries) + 1}",
+            'ENTRYTYPE': 'article',
+            'author': 'New Author',
+            'title': 'New Reference',
+            'year': '',
+            'journal': '',
+            'doi': '',
+            '_source_file_display': 'manual',
+        }
+        self._library_entries.append(new_entry)
+        if self.manager:
+            self.manager.all_entries = self._library_entries
+        self._apply_library_filter()
+
+    def _delete_selected_library_entry(self):
+        """Delete selected entry from in-memory library view and manager dataset."""
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        try:
+            self._library_entries.remove(entry)
+        except ValueError:
+            return
+        if self.manager:
+            self.manager.all_entries = self._library_entries
+        self._selected_library_entry = None
+        self._selected_library_key = ""
+        self._apply_library_filter()
+
+    def _export_selected_library_entry(self):
+        """Export currently selected entry as a .bib snippet."""
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Selected Entry",
+            defaultextension=".bib",
+            filetypes=[("BibTeX file", "*.bib"), ("All files", "*.*")],
+            initialfile=f"{entry.get('ID', 'reference')}.bib",
+        )
+        if not path:
+            return
+        entrytype = str(entry.get('ENTRYTYPE', 'article'))
+        key = str(entry.get('ID', 'reference'))
+        lines = [f"@{entrytype}{{{key},"]
+        for k in sorted(entry.keys()):
+            if k.startswith('_') or k in {'ENTRYTYPE', 'ID'}:
+                continue
+            value = str(entry.get(k, '')).strip()
+            if value:
+                lines.append(f"  {k} = {{{value}}},")
+        if lines[-1].endswith(','):
+            lines[-1] = lines[-1][:-1]
+        lines.append("}")
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+        self._set_status(f"Exported: {Path(path).name}", "#22c55e")
+
+    def _show_library_context_menu(self, event):
+        """Show row context menu with quick actions."""
+        if not hasattr(self, 'library_tree'):
+            return
+
+        row = self.library_tree.identify_row(event.y)
+        if not row:
+            return
+        self.library_tree.selection_set(row)
+        self._on_library_row_selected()
+
+        if self.library_context_menu is None:
+            self.library_context_menu = tk.Menu(self.root, tearoff=0)
+            self.library_context_menu.add_command(label="Copy Key", command=self._copy_selected_key)
+            self.library_context_menu.add_command(label="Add to Active Collection", command=self._add_selected_to_active_collection)
+            self.library_context_menu.add_command(label="Toggle Favorite", command=self._toggle_selected_favorite)
+            self.library_context_menu.add_separator()
+            self.library_context_menu.add_command(label="Review Duplicates", command=self._review_selected_duplicates)
+
+        try:
+            self.library_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.library_context_menu.grab_release()
+
+    def _copy_selected_key(self):
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(key)
+            self.root.update()
+            self._set_status(f"Copied key: {key}", "#60a5fa")
+        except Exception:
+            pass
+
+    def _review_selected_duplicates(self):
+        entry = self._get_selected_library_entry()
+        if not entry or not self.manager:
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            return
+
+        self._update_duplicates()
+        for idx, group in enumerate(self.manager.report_data.get('duplicate_groups', [])):
+            group_keys = {str(e.get('ID', '')).strip() for e in group.get('entries', [])}
+            if key in group_keys:
+                self._selected_duplicate_group = idx
+                self._sync_duplicate_selection_and_render()
+                self.tabview.set("🔍 Duplicates")
+                return
+
+        self._set_status("No duplicate group for selected entry", "#f59e0b")
+
+    def _save_selected_note(self):
+        entry = self._get_selected_library_entry()
+        if not entry or not hasattr(self, 'library_notes_text'):
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            return
+        self._library_notes[key] = self.library_notes_text.get("1.0", "end").strip()
+        self._set_status("Note saved", "#22c55e")
+
+    def _save_selected_tags(self):
+        entry = self._get_selected_library_entry()
+        if not entry or not hasattr(self, 'library_tags_text'):
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            return
+        self._library_tags[key] = self.library_tags_text.get("1.0", "end").strip()
+        self._set_status("Tags saved", "#22c55e")
+
+    def _save_selected_metadata(self):
+        """Persist edits from the metadata mini-form back to selected entry."""
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        entry['author'] = self.meta_author_var.get().strip()
+        entry['year'] = self.meta_year_var.get().strip()
+        entry['title'] = self.meta_title_var.get().strip()
+        source = self.meta_source_var.get().strip()
+        if source:
+            entry['journal'] = source
+        else:
+            entry.pop('journal', None)
+        doi = self.meta_doi_var.get().strip()
+        if doi:
+            entry['doi'] = doi
+        else:
+            entry.pop('doi', None)
+        self._refresh_library_tree()
+        self._on_library_row_selected()
+        self._set_status("Metadata saved (warnings update in status column)", "#22c55e")
+
+    def _on_library_tree_click(self, event):
+        """Single-click on status column toggles favorite, like desktop managers."""
+        if not hasattr(self, 'library_tree'):
+            return
+        region = self.library_tree.identify_region(event.x, event.y)
+        column = self.library_tree.identify_column(event.x)
+        row = self.library_tree.identify_row(event.y)
+        if region != "cell" or column != "#1" or not row:
+            return
+        try:
+            idx = int(row)
+        except Exception:
+            return
+        if idx < 0 or idx >= len(self._library_filtered_entries):
+            return
+        entry = self._library_filtered_entries[idx]
+        entry['_favorite'] = not bool(entry.get('_favorite'))
+        self._update_library_scope_buttons()
+        self._refresh_library_tree()
+        self.library_tree.selection_set(row)
+        self._on_library_row_selected()
+
+    def _toggle_selected_favorite(self, _event=None):
+        entry = self._get_selected_library_entry()
+        if not entry:
+            return
+        entry['_favorite'] = not bool(entry.get('_favorite'))
+        self._update_library_scope_buttons()
+        self._refresh_library_tree()
+
+    def _load_library_entries(self):
+        if not self.manager:
+            self._library_entries = []
+            self._library_filtered_entries = []
+            self._update_library_scope_buttons()
+            self._refresh_collection_menu()
+            self._refresh_library_tree()
+            return
+
+        old_favorites = {
+            str(e.get('ID', '')).strip(): bool(e.get('_favorite'))
+            for e in self._library_entries
+            if str(e.get('ID', '')).strip()
+        }
+        self._library_entries = list(self.manager.all_entries)
+        for e in self._library_entries:
+            key = str(e.get('ID', '')).strip()
+            if key and key in old_favorites:
+                e['_favorite'] = old_favorites[key]
+
+        valid_keys = {str(e.get('ID', '')).strip() for e in self._library_entries if str(e.get('ID', '')).strip()}
+        for name in list(self._custom_collections.keys()):
+            self._custom_collections[name] = {k for k in self._custom_collections[name] if k in valid_keys}
+
+        self._update_library_scope_buttons()
+        self._refresh_collection_menu()
+        self._apply_library_filter()
+
+    def _apply_library_filter(self):
+        entries = list(self._library_entries)
+        duplicate_keys = set()
+        if self.manager:
+            for group in self.manager.report_data.get('duplicate_groups', []):
+                for entry in group.get('entries', []):
+                    key = str(entry.get('ID', '')).strip()
+                    if key:
+                        duplicate_keys.add(key)
+
+        if self._library_scope == "Recently Added":
+            entries = entries[-200:]
+        elif self._library_scope == "Favorites":
+            entries = [e for e in entries if e.get('_favorite')]
+        elif self._library_scope == "Duplicate Items":
+            entries = [e for e in entries if str(e.get('ID', '')).strip() in duplicate_keys]
+        elif self._library_scope == "Collection" and self._active_collection_name in self._custom_collections:
+            members = self._custom_collections[self._active_collection_name]
+            entries = [e for e in entries if str(e.get('ID', '')).strip() in members]
+
+        query = ""
+        if hasattr(self, 'library_search_var'):
+            query = (self.library_search_var.get() or "").strip().lower()
+        if query:
+            def _match(e):
+                blob = " ".join([
+                    str(e.get('ID', '')),
+                    str(e.get('author', '')),
+                    str(e.get('title', '')),
+                    str(e.get('year', '')),
+                    str(e.get('journal', '')),
+                ]).lower()
+                return query in blob
+            entries = [e for e in entries if _match(e)]
+
+        if hasattr(self, 'filter_duplicates_var') and self.filter_duplicates_var.get():
+            entries = [e for e in entries if str(e.get('ID', '')).strip() in duplicate_keys]
+        if hasattr(self, 'filter_doi_var') and self.filter_doi_var.get():
+            entries = [e for e in entries if str(e.get('doi', '')).strip()]
+        if hasattr(self, 'filter_missing_year_var') and self.filter_missing_year_var.get():
+            entries = [e for e in entries if not str(e.get('year', '')).strip()]
+
+        self._library_filtered_entries = entries
+        self._refresh_library_tree()
+
+    def _refresh_library_tree(self):
+        if not hasattr(self, 'library_tree'):
+            return
+        for item in self.library_tree.get_children():
+            self.library_tree.delete(item)
+
+        duplicate_key_set = {
+            str(item.get('ID', '')).strip()
+            for group in (self.manager.report_data.get('duplicate_groups', []) if self.manager else [])
+            for item in group.get('entries', [])
+            if str(item.get('ID', '')).strip()
+        }
+
+        for idx, entry in enumerate(self._library_filtered_entries):
+            is_favorite = bool(entry.get('_favorite'))
+            is_duplicate = str(entry.get('ID', '')).strip() in duplicate_key_set
+            missing_core = not str(entry.get('author', '')).strip() or not str(entry.get('title', '')).strip() or not str(entry.get('year', '')).strip()
+            markers = []
+            if is_favorite:
+                markers.append("★")
+            if is_duplicate:
+                markers.append("●")
+            if missing_core:
+                markers.append("⚠")
+            status = " ".join(markers)
+            author = str(entry.get('author', 'Unknown')).replace('{', '').replace('}', '')
+            year = str(entry.get('year', ''))
+            title = str(entry.get('title', 'No title')).replace('{', '').replace('}', '')
+            source = str(entry.get('journal') or entry.get('booktitle') or entry.get('_source_file_display') or '')
+            key = str(entry.get('ID', ''))
+            self.library_tree.insert('', 'end', iid=str(idx), values=(status, author, year, title, source, key))
+
+    def _sort_library_tree(self, column: str, numeric: bool):
+        if not hasattr(self, 'library_tree'):
+            return
+        rows = [(self.library_tree.set(k, column), k) for k in self.library_tree.get_children('')]
+        if numeric:
+            rows.sort(key=lambda t: int(''.join(ch for ch in str(t[0]) if ch.isdigit()) or 0), reverse=True)
+        else:
+            rows.sort(key=lambda t: str(t[0]).lower())
+        for pos, (_val, iid) in enumerate(rows):
+            self.library_tree.move(iid, '', pos)
+
+    def _on_library_row_selected(self, _event=None):
+        if not hasattr(self, 'library_tree'):
+            return
+        selected = self.library_tree.selection()
+        if not selected:
+            return
+        try:
+            idx = int(selected[0])
+        except Exception:
+            return
+        if idx < 0 or idx >= len(self._library_filtered_entries):
+            return
+        entry = self._library_filtered_entries[idx]
+        self._selected_library_entry = entry
+        self._selected_library_key = str(entry.get('ID', '')).strip()
+
+        details = []
+        details.append(f"Key: {entry.get('ID', '')}")
+        details.append(f"Type: {entry.get('ENTRYTYPE', '')}")
+        details.append(f"Author: {entry.get('author', '')}")
+        details.append(f"Title: {entry.get('title', '')}")
+        details.append(f"Year: {entry.get('year', '')}")
+        details.append(f"Journal/Book: {entry.get('journal', entry.get('booktitle', ''))}")
+        details.append(f"DOI: {entry.get('doi', '')}")
+        details.append(f"Source File: {entry.get('_source_file_display', entry.get('_source_file', ''))}")
+        details.append("")
+        details.append("Raw fields")
+        details.append("-" * 40)
+        for k in sorted(entry.keys()):
+            if k.startswith('_'):
+                continue
+            details.append(f"{k}: {entry.get(k, '')}")
+
+        if hasattr(self, 'library_info_text'):
+            self.library_info_text.delete("1.0", "end")
+            self.library_info_text.insert("1.0", "\n".join(details))
+
+        if hasattr(self, 'meta_author_var'):
+            self.meta_author_var.set(str(entry.get('author', '')))
+        if hasattr(self, 'meta_year_var'):
+            self.meta_year_var.set(str(entry.get('year', '')))
+        if hasattr(self, 'meta_title_var'):
+            self.meta_title_var.set(str(entry.get('title', '')))
+        if hasattr(self, 'meta_source_var'):
+            self.meta_source_var.set(str(entry.get('journal', entry.get('booktitle', ''))))
+        if hasattr(self, 'meta_doi_var'):
+            self.meta_doi_var.set(str(entry.get('doi', '')))
+
+        if hasattr(self, 'library_notes_text'):
+            note = self._library_notes.get(self._selected_library_key, "")
+            self.library_notes_text.delete("1.0", "end")
+            self.library_notes_text.insert("1.0", note)
+
+        if hasattr(self, 'library_tags_text'):
+            tags = self._library_tags.get(self._selected_library_key, "")
+            self.library_tags_text.delete("1.0", "end")
+            self.library_tags_text.insert("1.0", tags)
         
     def _build_pipeline_tab(self):
         """Build pipeline execution tab with step cards"""
@@ -541,62 +1410,44 @@ class ModernBibGUI:
         self.results_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _build_fixes_tab(self):
-        """Build fixes side-by-side viewer tab"""
+        """Build fixes tab with a single inline IDE-style diff viewer."""
         tab = self.tabview.tab("🛠 Fixes")
         tab.grid_rowconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=0)
-        tab.grid_rowconfigure(2, weight=0)
-        tab.grid_columnconfigure((0, 1), weight=1)
-        tab.grid_columnconfigure(2, weight=0)
+        tab.grid_rowconfigure(2, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
 
-        # Left: file selector and original file
-        left_frame = ctk.CTkFrame(tab)
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=(10,5), pady=10)
-        left_frame.grid_rowconfigure(1, weight=1)
-        left_frame.grid_columnconfigure(0, weight=1)
+        controls = ctk.CTkFrame(tab, fg_color="transparent")
+        controls.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        controls.grid_columnconfigure(1, weight=1)
 
-        self.fix_file_menu = ctk.CTkOptionMenu(left_frame, values=["No changed files yet"], command=self._show_file_fix)
-        self.fix_file_menu.grid(row=0, column=0, padx=10, pady=(10,5), sticky="ew")
+        self.fix_file_menu = ctk.CTkOptionMenu(controls, values=["No changed files yet"], command=self._show_file_fix)
+        self.fix_file_menu.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="w")
         self.fix_file_menu.set("No changed files yet")
 
-        self.orig_text = ctk.CTkTextbox(
-            left_frame,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            wrap="none"
+        self.changed_info = ctk.CTkLabel(
+            controls,
+            text="Choose a file to inspect inline fixes",
+            text_color="gray",
+            anchor="w",
         )
-        self.orig_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5,10))
+        self.changed_info.grid(row=0, column=1, sticky="ew")
 
-        # Right: updated file
-        right_frame = ctk.CTkFrame(tab)
-        right_frame.grid(row=0, column=1, sticky="nsew", padx=(5,10), pady=10)
-        right_frame.grid_rowconfigure(1, weight=1)
-        right_frame.grid_columnconfigure(0, weight=1)
-
-        label = ctk.CTkLabel(right_frame, text="Updated (Fixed)", font=ctk.CTkFont(size=14, weight="bold"))
-        label.grid(row=0, column=0, padx=10, pady=(10,5), sticky="w")
-
-        self.updated_text = ctk.CTkTextbox(
-            right_frame,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            wrap="none"
+        self.show_unchanged_switch = ctk.CTkSwitch(
+            controls,
+            text="Show unchanged lines",
+            variable=self._show_unchanged_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._refresh_current_fix_selection,
         )
-        self.updated_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5,10))
+        self.show_unchanged_switch.grid(row=0, column=2, padx=(10, 0), sticky="e")
 
-        # Shared vertical scrollbar for synchronized scrolling
-        self.fixes_scrollbar = ctk.CTkScrollbar(tab, orientation="vertical", command=self._on_fixes_scroll)
-        self.fixes_scrollbar.grid(row=0, column=2, sticky="ns", padx=(0, 10), pady=10)
-
-        # Shared horizontal scrollbar for synchronized scrolling
-        self.fixes_h_scrollbar = ctk.CTkScrollbar(tab, orientation="horizontal", command=self._on_fixes_xscroll)
-        self.fixes_h_scrollbar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(10, 10), pady=(0, 8))
-
-        # Navigation controls
-        nav_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        nav_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 6))
-        nav_frame.grid_columnconfigure(2, weight=1)
+        nav = ctk.CTkFrame(tab, fg_color="transparent")
+        nav.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
 
         self.prev_change_btn = ctk.CTkButton(
-            nav_frame,
+            nav,
             text="◀ Prev Change",
             width=130,
             height=30,
@@ -606,7 +1457,7 @@ class ModernBibGUI:
         self.prev_change_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         self.next_change_btn = ctk.CTkButton(
-            nav_frame,
+            nav,
             text="Next Change ▶",
             width=130,
             height=30,
@@ -615,54 +1466,20 @@ class ModernBibGUI:
         )
         self.next_change_btn.grid(row=0, column=1, padx=(0, 8), sticky="w")
 
-        self.normalize_keys_btn = ctk.CTkButton(
-            nav_frame,
-            text="Normalize All Keys",
-            width=160,
-            height=30,
-            command=self._run_pipeline,
-            state="normal"
+        legend = ctk.CTkLabel(
+            nav,
+            text="IDE diff: ↺ replace (red old + green new), − delete (red), + insert (green)",
+            text_color="#94a3b8",
+            font=ctk.CTkFont(size=11),
         )
-        self.normalize_keys_btn.grid(row=0, column=2, padx=(0, 8), sticky="w")
+        legend.grid(row=0, column=2, sticky="w")
 
-        # Visual legend badges for demo clarity
-        legend_frame = ctk.CTkFrame(nav_frame, fg_color="transparent")
-        legend_frame.grid(row=0, column=3, sticky="e")
-
-        self.legend_orig = ctk.CTkLabel(
-            legend_frame,
-            text=" 🟨 Original Change ",
-            fg_color="#ffe08a",
-            text_color="#111111",
-            corner_radius=6,
-            font=ctk.CTkFont(size=11)
+        self.fixes_diff_text = ctk.CTkTextbox(
+            tab,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="none"
         )
-        self.legend_orig.grid(row=0, column=0, padx=(0, 6))
-
-        self.legend_fixed = ctk.CTkLabel(
-            legend_frame,
-            text=" 🟩 Fixed Change ",
-            fg_color="#b6f2c7",
-            text_color="#111111",
-            corner_radius=6,
-            font=ctk.CTkFont(size=11)
-        )
-        self.legend_fixed.grid(row=0, column=1, padx=(0, 6))
-
-        self.legend_marker = ctk.CTkLabel(
-            legend_frame,
-            text="🔎 >> changed line",
-            text_color="gray",
-            font=ctk.CTkFont(size=11)
-        )
-        self.legend_marker.grid(row=0, column=2)
-
-        # Info label for changed lines
-        self.changed_info = ctk.CTkLabel(tab, text="", text_color="gray")
-        self.changed_info.grid(row=1, column=0, columnspan=2, sticky="e", padx=20, pady=(0,6))
-
-        # Setup synchronized scrolling bindings
-        self._setup_fixes_scroll_sync()
+        self.fixes_diff_text.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _get_text_widget(self, ctk_textbox):
         """Return underlying tkinter Text widget from CTkTextbox."""
@@ -706,7 +1523,8 @@ class ModernBibGUI:
             tk_orig.yview(*args)
             tk_upd.yview(*args)
             first, last = tk_orig.yview()
-            self.fixes_scrollbar.set(first, last)
+            if self.fixes_scrollbar:
+                self.fixes_scrollbar.set(first, last)
         finally:
             self._syncing_scroll = False
 
@@ -717,7 +1535,8 @@ class ModernBibGUI:
         tk_upd = self._get_text_widget(self.updated_text)
         self._syncing_scroll = True
         try:
-            self.fixes_scrollbar.set(first, last)
+            if self.fixes_scrollbar:
+                self.fixes_scrollbar.set(first, last)
             if tk_upd:
                 tk_upd.yview_moveto(float(first))
         finally:
@@ -730,7 +1549,8 @@ class ModernBibGUI:
         tk_orig = self._get_text_widget(self.orig_text)
         self._syncing_scroll = True
         try:
-            self.fixes_scrollbar.set(first, last)
+            if self.fixes_scrollbar:
+                self.fixes_scrollbar.set(first, last)
             if tk_orig:
                 tk_orig.yview_moveto(float(first))
         finally:
@@ -748,7 +1568,8 @@ class ModernBibGUI:
             tk_orig.xview(*args)
             tk_upd.xview(*args)
             first, last = tk_orig.xview()
-            self.fixes_h_scrollbar.set(first, last)
+            if self.fixes_h_scrollbar:
+                self.fixes_h_scrollbar.set(first, last)
         finally:
             self._syncing_scroll_x = False
 
@@ -759,7 +1580,8 @@ class ModernBibGUI:
         tk_upd = self._get_text_widget(self.updated_text)
         self._syncing_scroll_x = True
         try:
-            self.fixes_h_scrollbar.set(first, last)
+            if self.fixes_h_scrollbar:
+                self.fixes_h_scrollbar.set(first, last)
             if tk_upd:
                 tk_upd.xview_moveto(float(first))
         finally:
@@ -772,45 +1594,54 @@ class ModernBibGUI:
         tk_orig = self._get_text_widget(self.orig_text)
         self._syncing_scroll_x = True
         try:
-            self.fixes_h_scrollbar.set(first, last)
+            if self.fixes_h_scrollbar:
+                self.fixes_h_scrollbar.set(first, last)
             if tk_orig:
                 tk_orig.xview_moveto(float(first))
         finally:
             self._syncing_scroll_x = False
 
     def _scroll_to_changed_line(self, line_no: int):
-        """Scroll both panes to a target line number."""
-        tk_orig = self._get_text_widget(self.orig_text)
-        tk_upd = self._get_text_widget(self.updated_text)
+        """Scroll unified fixes diff pane to a target line number."""
+        tk_diff = self._get_text_widget(self.fixes_diff_text)
         idx = f"{line_no}.0"
         try:
-            if tk_orig:
-                tk_orig.see(idx)
-            if tk_upd:
-                tk_upd.see(idx)
+            if tk_diff:
+                tk_diff.see(idx)
         except Exception:
             pass
 
+    def _refresh_current_fix_selection(self):
+        """Re-render current file in Fixes tab (used after diff display option changes)."""
+        try:
+            current = self.fix_file_menu.get()
+        except Exception:
+            current = None
+        if current and current != "No changed files yet":
+            self._show_file_fix(current)
+
     def _jump_next_changed_line(self):
         """Jump to the next changed line."""
-        if not self._current_changed_lines:
+        if not self._current_changed_display_lines:
             return
-        self._current_changed_idx = (self._current_changed_idx + 1) % len(self._current_changed_lines)
-        ln = self._current_changed_lines[self._current_changed_idx]
-        self._scroll_to_changed_line(ln)
+        self._current_changed_idx = (self._current_changed_idx + 1) % len(self._current_changed_display_lines)
+        display_ln = self._current_changed_display_lines[self._current_changed_idx]
+        self._scroll_to_changed_line(display_ln)
+        source_ln = self._current_changed_lines[min(self._current_changed_idx, len(self._current_changed_lines) - 1)] if self._current_changed_lines else "?"
         self.changed_info.configure(
-            text=f"Change {self._current_changed_idx + 1}/{len(self._current_changed_lines)} at line {ln}"
+            text=f"Change {self._current_changed_idx + 1}/{len(self._current_changed_display_lines)} (source line {source_ln})"
         )
 
     def _jump_prev_changed_line(self):
         """Jump to the previous changed line."""
-        if not self._current_changed_lines:
+        if not self._current_changed_display_lines:
             return
-        self._current_changed_idx = (self._current_changed_idx - 1) % len(self._current_changed_lines)
-        ln = self._current_changed_lines[self._current_changed_idx]
-        self._scroll_to_changed_line(ln)
+        self._current_changed_idx = (self._current_changed_idx - 1) % len(self._current_changed_display_lines)
+        display_ln = self._current_changed_display_lines[self._current_changed_idx]
+        self._scroll_to_changed_line(display_ln)
+        source_ln = self._current_changed_lines[min(self._current_changed_idx, len(self._current_changed_lines) - 1)] if self._current_changed_lines else "?"
         self.changed_info.configure(
-            text=f"Change {self._current_changed_idx + 1}/{len(self._current_changed_lines)} at line {ln}"
+            text=f"Change {self._current_changed_idx + 1}/{len(self._current_changed_display_lines)} (source line {source_ln})"
         )
 
     def _on_fixes_mousewheel(self, event):
@@ -1057,13 +1888,37 @@ class ModernBibGUI:
         """Clear logs/results quickly for a fresh demo run."""
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
-        self.orig_text.delete("1.0", "end")
-        self.updated_text.delete("1.0", "end")
+        if hasattr(self, 'fixes_diff_text'):
+            self.fixes_diff_text.delete("1.0", "end")
         self.changed_info.configure(text="")
         self._current_changed_lines = []
+        self._current_changed_display_lines = []
         self._current_changed_idx = -1
         self.prev_change_btn.configure(state="disabled")
         self.next_change_btn.configure(state="disabled")
+        self._library_entries = []
+        self._library_filtered_entries = []
+        self._selected_library_key = ""
+        self._selected_library_entry = None
+        if hasattr(self, 'library_info_text'):
+            self.library_info_text.delete("1.0", "end")
+            self.library_info_text.insert("1.0", "Run pipeline, then select a reference to view metadata.")
+        if hasattr(self, 'meta_author_var'):
+            self.meta_author_var.set("")
+        if hasattr(self, 'meta_year_var'):
+            self.meta_year_var.set("")
+        if hasattr(self, 'meta_title_var'):
+            self.meta_title_var.set("")
+        if hasattr(self, 'meta_source_var'):
+            self.meta_source_var.set("")
+        if hasattr(self, 'meta_doi_var'):
+            self.meta_doi_var.set("")
+        if hasattr(self, 'library_notes_text'):
+            self.library_notes_text.delete("1.0", "end")
+        if hasattr(self, 'library_tags_text'):
+            self.library_tags_text.delete("1.0", "end")
+        self._update_library_scope_buttons()
+        self._refresh_library_tree()
         self._set_status("Ready", "#3b8ed0")
         
     def _browse_directory(self):
@@ -1387,6 +2242,7 @@ class ModernBibGUI:
             
             # Update results
             self._ui_call(self._update_results)
+            self._ui_call(self._load_library_entries)
             # Defer heavy duplicates rendering until user opens the Duplicates tab.
             self._pending_duplicates_refresh = True
             
@@ -1899,7 +2755,7 @@ class ModernBibGUI:
             self._scroll_to_duplicate_highlight()
 
     def _show_file_fix(self, selection: str):
-        """Display original and updated contents for selected file, marking changed lines."""
+        """Display IDE-style unified inline diff for selected changed file."""
         if not self.manager:
             return
 
@@ -1918,83 +2774,98 @@ class ModernBibGUI:
         upd = info.get('updated', '')
         changed = info.get('changed_lines', [])
 
-        # Build IDE-style indexed lines with explicit markers.
-        def _indexed_view(text: str, changes):
-            rows = text.splitlines()
-            out = []
-            for i, line in enumerate(rows, start=1):
-                marker = ">>" if i in changes else "  "
-                out.append(f"{i:4d} {marker} | {line}")
-            return "\n".join(out)
+        orig_lines = orig.splitlines()
+        upd_lines = upd.splitlines()
+        matcher = difflib.SequenceMatcher(None, orig_lines, upd_lines)
+        show_unchanged = bool(self._show_unchanged_var.get())
+        context = self._diff_context_lines
 
-        orig_indexed = _indexed_view(orig, changed)
-        upd_indexed = _indexed_view(upd, changed)
+        render_lines = []
+        red_display_lines = []
+        green_display_lines = []
+        display_change_lines = []
 
-        # Insert plain text into CTkTextboxes
-        self.orig_text.delete('1.0', 'end')
-        self.updated_text.delete('1.0', 'end')
-        self.orig_text.insert('1.0', orig_indexed)
-        self.updated_text.insert('1.0', upd_indexed)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                block_len = i2 - i1
+                if show_unchanged or block_len <= context * 2:
+                    for offset in range(block_len):
+                        src_ln = i1 + offset + 1
+                        render_lines.append(f"{src_ln:4d}   {orig_lines[i1 + offset]}")
+                else:
+                    for offset in range(context):
+                        src_ln = i1 + offset + 1
+                        render_lines.append(f"{src_ln:4d}   {orig_lines[i1 + offset]}")
+                    hidden = block_len - (context * 2)
+                    render_lines.append(f"{'....':>4}   ... {hidden} unchanged lines hidden ...")
+                    for offset in range(block_len - context, block_len):
+                        src_ln = i1 + offset + 1
+                        render_lines.append(f"{src_ln:4d}   {orig_lines[i1 + offset]}")
+                continue
 
-        # Apply colored highlighting to changed lines using underlying tkinter Text
-        try:
-            tk_orig = (
-                getattr(self.orig_text, '_textbox', None)
-                or getattr(self.orig_text, 'textbox', None)
-                or getattr(self.orig_text, 'text', None)
-            )
-            tk_upd = (
-                getattr(self.updated_text, '_textbox', None)
-                or getattr(self.updated_text, 'textbox', None)
-                or getattr(self.updated_text, 'text', None)
-            )
+            chunk_first_display = len(render_lines) + 1
+            marker = '↺' if tag == 'replace' else ('−' if tag == 'delete' else '+')
+            render_lines.append(f"{'----':>4} {marker} --- {tag.upper()} ---")
+            block_header_line = len(render_lines)
 
-            # Remove previous tags
-            if tk_orig:
-                for tag in ('hl_changed',):
+            if tag in ('replace', 'delete'):
+                for idx in range(i1, i2):
+                    src_ln = idx + 1
+                    render_lines.append(f"{src_ln:4d} - {orig_lines[idx]}")
+                    red_display_lines.append(len(render_lines))
+
+            if tag in ('replace', 'insert'):
+                for idx in range(j1, j2):
+                    src_ln = idx + 1
+                    render_lines.append(f"{src_ln:4d} + {upd_lines[idx]}")
+                    green_display_lines.append(len(render_lines))
+
+            display_change_lines.append(block_header_line if block_header_line else chunk_first_display)
+
+        self.fixes_diff_text.delete('1.0', 'end')
+        self.fixes_diff_text.insert('1.0', "\n".join(render_lines))
+
+        tk_diff = self._get_text_widget(self.fixes_diff_text)
+        if tk_diff:
+            try:
+                for tag_name in ('hl_removed', 'hl_added', 'hl_block_header', 'hl_fold'):
                     try:
-                        tk_orig.tag_delete(tag)
+                        tk_diff.tag_delete(tag_name)
                     except Exception:
                         pass
-                tk_orig.tag_configure('hl_changed', background='#ffe08a', foreground='#111111')  # strong yellow
+                tk_diff.tag_configure('hl_removed', background='#3a1f1f', foreground='#ffb4b4')
+                tk_diff.tag_configure('hl_added', background='#153524', foreground='#b7f7cd')
+                tk_diff.tag_configure('hl_block_header', background='#1f2937', foreground='#93c5fd')
+                tk_diff.tag_configure('hl_fold', foreground='#94a3b8')
 
-            if tk_upd:
-                for tag in ('hl_changed_upd',):
-                    try:
-                        tk_upd.tag_delete(tag)
-                    except Exception:
-                        pass
-                tk_upd.tag_configure('hl_changed_upd', background='#b6f2c7', foreground='#111111')  # strong green
+                for ln in red_display_lines:
+                    tk_diff.tag_add('hl_removed', f"{ln}.0", f"{ln}.end")
+                for ln in green_display_lines:
+                    tk_diff.tag_add('hl_added', f"{ln}.0", f"{ln}.end")
 
-            # Add tags to each changed line (1-based indices)
-            for ln in changed:
-                start = f"{ln}.0"
-                end = f"{ln}.end"
-                try:
-                    if tk_orig:
-                        tk_orig.tag_add('hl_changed', start, end)
-                    if tk_upd:
-                        tk_upd.tag_add('hl_changed_upd', start, end)
-                except Exception:
-                    # If line index out of range, skip
-                    continue
-        except Exception:
-            # Silently ignore highlighting errors
-            pass
+                for i, content in enumerate(render_lines, start=1):
+                    if content.endswith("---") and " --- " in content:
+                        tk_diff.tag_add('hl_block_header', f"{i}.0", f"{i}.end")
+                    if "unchanged lines hidden" in content:
+                        tk_diff.tag_add('hl_fold', f"{i}.0", f"{i}.end")
+            except Exception:
+                pass
 
         # Show summary of changed lines
-        if changed:
+        if changed and display_change_lines:
             display = changed[:20]
             suffix = ' ...' if len(changed) > 20 else ''
             self.changed_info.configure(text=f"Changed lines ({len(changed)}): {display}{suffix}")
             self._current_changed_lines = sorted(changed)
+            self._current_changed_display_lines = sorted(set(display_change_lines))
             self._current_changed_idx = 0
             self.prev_change_btn.configure(state="normal")
             self.next_change_btn.configure(state="normal")
-            self._scroll_to_changed_line(self._current_changed_lines[0])
+            self._scroll_to_changed_line(self._current_changed_display_lines[0])
         else:
             self.changed_info.configure(text="No inline changes recorded.")
             self._current_changed_lines = []
+            self._current_changed_display_lines = []
             self._current_changed_idx = -1
             self.prev_change_btn.configure(state="disabled")
             self.next_change_btn.configure(state="disabled")
