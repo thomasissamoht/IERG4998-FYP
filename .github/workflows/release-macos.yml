@@ -1,0 +1,36 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Make build script executable
+        run: chmod +x installer/build_mac_setup.sh
+
+      - name: Build macOS package
+        run: ./installer/build_mac_setup.sh
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/output/*.dmg
+            installer/output/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

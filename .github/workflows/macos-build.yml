@@ -1,0 +1,36 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build app with PyInstaller
+        run: |
+          pyinstaller --onefile bib_gui_modern.py --name BibTeXManagerMac
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: BibTeXManager-mac
+          path: dist/BibTeXManagerMac

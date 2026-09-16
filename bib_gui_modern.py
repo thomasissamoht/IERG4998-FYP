@@ -5,10 +5,13 @@ Using CustomTkinter for a beautiful, modern interface
 """
 
 import customtkinter as ctk
+import ctypes
 import threading
 import webbrowser
 import difflib
+from collections import Counter
 from pathlib import Path
+import tarfile
 from typing import Optional
 from bib import BibliographyManager
 import importlib
@@ -27,7 +30,7 @@ if TYPE_CHECKING:
     webview: Any  # pragma: no cover
 
 # Set appearance mode and color theme
-ctk.set_appearance_mode("dark")  # Modes: "System" (default), "Dark", "Light"
+ctk.set_appearance_mode("light")  # Modes: "System" (default), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (default), "green", "dark-blue"
 
 
@@ -61,6 +64,15 @@ class ModernBibGUI:
         self._diff_context_lines = 2
         self._last_master_path = None
         self._last_cleaned_zip = None
+        self._sidebar_mode = None
+        self._sidebar_icon_buttons = {}
+        self._sidebar_sections = {}
+        self._redraw_suspend_count = 0
+        self._theme_mode = "light"
+        self._theme_apply_job = None
+        self._last_applied_theme = None
+        self._tooltip_window = None
+        self._tooltip_job = None
         self._status_text = ctk.StringVar(value="Ready")
         self._log_count = 0
         self._log_buffer = []
@@ -83,6 +95,9 @@ class ModernBibGUI:
         self._library_filtered_entries = []
         self._library_scope = "All References"
         self._library_scope_buttons = {}
+        self._library_left_mode = None
+        self._library_left_icon_buttons = {}
+        self._library_left_minsize = 220
         self._custom_collections: dict[str, set[str]] = {}
         self._active_collection_name: Optional[str] = None
         self._library_notes: dict[str, str] = {}
@@ -105,6 +120,276 @@ class ModernBibGUI:
         # Build UI
         self._build_ui()
 
+    def _theme_palette(self, mode: Optional[str] = None) -> dict[str, str]:
+        mode = (mode or self._theme_mode or "dark").lower()
+        if mode == "light":
+            return {
+                "root": "#eef2f7",
+                "main": "#f7f9fc",
+                "header": "#ffffff",
+                "panel": "#ffffff",
+                "panel2": "#eef3f9",
+                "card": "#ffffff",
+                "surface": "#f4f7fb",
+                "rail": "#e7edf5",
+                "rail_active": "#d7e4f5",
+                "border": "#d3dce8",
+                "text": "#162133",
+                "muted": "#5d6c82",
+                "muted2": "#8090a6",
+                "accent": "#0f6fff",
+                "accent_text": "#ffffff",
+                "badge_bg": "#eaf2ff",
+                "badge_text": "#0f4eb8",
+                "button": "#e5ebf4",
+                "button_hover": "#d6e0ee",
+                "button_text": "#162133",
+                "input_bg": "#ffffff",
+                "input_border": "#cbd5e2",
+                "tree_bg": "#ffffff",
+                "tree_head": "#e7eef8",
+                "tree_sel": "#cde0ff",
+                "tree_sel_text": "#10233f",
+                "textbox_bg": "#ffffff",
+                "icon_rail": "#e9eef6",
+                "icon_active": "#d8e5f7",
+            }
+        return {
+            "root": "#101218",
+            "main": "#0f1218",
+            "header": "#161b24",
+            "panel": "#161b24",
+            "panel2": "#141922",
+            "card": "#161b24",
+            "surface": "#161b24",
+            "rail": "#0b1322",
+            "rail_active": "#2b3a54",
+            "border": "#222938",
+            "text": "#e5edf9",
+            "muted": "#8f99ab",
+            "muted2": "#7f8ba1",
+            "accent": "#2878ff",
+            "accent_text": "#ffffff",
+            "badge_bg": "#1f2937",
+            "badge_text": "#93c5fd",
+            "button": "#1f2a3c",
+            "button_hover": "#2b3b57",
+            "button_text": "#e5edf9",
+            "input_bg": "#10151d",
+            "input_border": "#222938",
+            "tree_bg": "#0d1523",
+            "tree_head": "#1c2840",
+            "tree_sel": "#2c5d93",
+            "tree_sel_text": "#ffffff",
+            "textbox_bg": "#10151d",
+            "icon_rail": "#0b1322",
+            "icon_active": "#2b3a54",
+        }
+
+    def _apply_theme_palette(self, mode: Optional[str] = None):
+        """Apply a light or dark palette to the major app surfaces."""
+        applied_mode = (mode or self._theme_mode or "light").lower()
+        palette = self._theme_palette(applied_mode)
+
+        def set_cfg(widget, **kwargs):
+            if widget is None:
+                return
+            try:
+                changed = False
+                for key, value in kwargs.items():
+                    try:
+                        current_value = widget.cget(key)
+                    except Exception:
+                        changed = True
+                        break
+                    if current_value != value:
+                        changed = True
+                        break
+                if not changed:
+                    return
+                widget.configure(**kwargs)
+            except Exception:
+                pass
+
+        set_cfg(self.root, fg_color=palette["root"])
+        set_cfg(getattr(self, "_sidebar_root", None), fg_color=palette["panel"])
+        set_cfg(getattr(self, "_sidebar_panel_host", None), fg_color="transparent")
+        set_cfg(getattr(self, "_sidebar_brand", None), fg_color="transparent")
+        set_cfg(getattr(self, "sidebar_root", None), fg_color=palette["panel"])
+        set_cfg(getattr(self, "sidebar_icon_rail", None), fg_color=palette["icon_rail"])
+        set_cfg(getattr(self, "library_icon_rail", None), fg_color=palette["icon_rail"])
+        for card_name in ("workspace_card", "options_card", "keys_card", "actions_card", "appearance_card"):
+            set_cfg(getattr(self, card_name, None), fg_color=palette["card"], border_color=palette["border"])
+
+        set_cfg(getattr(self, "main_frame", None), fg_color=palette["main"])
+        set_cfg(getattr(self, "header", None), fg_color=palette["header"], border_color=palette["border"])
+        set_cfg(getattr(self, "top_status_badge", None), fg_color=palette["badge_bg"], text_color=palette["badge_text"])
+        set_cfg(getattr(self, "header_actions", None), fg_color="transparent")
+
+        set_cfg(
+            getattr(self, "tabview", None),
+            fg_color=palette["panel2"],
+            segmented_button_fg_color=palette["button"],
+            segmented_button_selected_color=palette["accent"],
+            segmented_button_selected_hover_color=palette["accent"],
+            segmented_button_unselected_color=palette["button"],
+            segmented_button_unselected_hover_color=palette["button_hover"],
+            text_color=palette["button_text"],
+            text_color_disabled=palette["muted2"],
+        )
+        set_cfg(getattr(self, "library_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "library_left_shell", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_left_content", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "library_left_frame", None), fg_color=palette["card"], border_color=palette["border"])
+        set_cfg(getattr(self, "library_scopes_panel", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_collections_panel", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_center_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "library_top_frame", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_toolbar_frame", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_filters_frame", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_tree_frame", None), fg_color=palette["surface"])
+        set_cfg(getattr(self, "library_right_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "library_detail_actions", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_details_tabs", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "library_metadata_frame", None), fg_color=palette["card"])
+
+        set_cfg(getattr(self, "pipeline_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "pipeline_steps_section", None), fg_color="transparent")
+        set_cfg(getattr(self, "pipeline_step_strip", None), fg_color=palette["surface"])
+        set_cfg(getattr(self, "pipeline_log_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "results_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "results_hero_frame", None), fg_color="transparent")
+        set_cfg(getattr(self, "results_scroll", None), fg_color="transparent")
+        set_cfg(getattr(self, "results_metrics_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "results_summary_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "results_files_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "results_folders_frame", None), fg_color=palette["card"])
+        set_cfg(getattr(self, "results_title_label", None), text_color=palette["text"])
+        set_cfg(getattr(self, "results_subtitle_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "results_scope_label", None), text_color=palette["muted2"])
+        set_cfg(getattr(self, "results_text_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "results_files_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "results_folders_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "fixes_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "fixes_controls", None), fg_color="transparent")
+        set_cfg(getattr(self, "fixes_nav", None), fg_color="transparent")
+        set_cfg(getattr(self, "fixes_diff_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "duplicates_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "duplicates_controls", None), fg_color="transparent")
+        set_cfg(getattr(self, "duplicates_file_controls", None), fg_color="transparent")
+        set_cfg(getattr(self, "duplicates_decision_panel", None), fg_color="transparent")
+        set_cfg(getattr(self, "duplicates_text_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "about_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "about_scroll", None), fg_color="transparent")
+        set_cfg(getattr(self, "about_label", None), text_color=palette["text"])
+
+        set_cfg(getattr(self, "library_info_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "library_notes_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "library_tags_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "meta_author_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+        set_cfg(getattr(self, "meta_year_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+        set_cfg(getattr(self, "meta_source_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+        set_cfg(getattr(self, "meta_doi_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+        set_cfg(getattr(self, "meta_title_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+        set_cfg(getattr(self, "library_tree_y_scroll", None), fg_color=palette["surface"], button_color=palette["button"], button_hover_color=palette["button_hover"])
+        set_cfg(getattr(self, "library_tree_x_scroll", None), fg_color=palette["surface"], button_color=palette["button"], button_hover_color=palette["button_hover"])
+        set_cfg(getattr(self, "results_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "log_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "fixes_diff_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "duplicates_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+
+        for entry_name in ("dir_entry", "collection_entry", "citekey_custom_entry", "library_search_entry"):
+            set_cfg(getattr(self, entry_name, None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
+
+        for button_name in ("browse_btn", "source_file_btn", "demo_btn", "clear_btn", "run_btn", "cancel_btn", "view_report_btn", "library_add_btn", "library_delete_btn", "library_export_btn", "copy_key_btn", "add_selected_btn", "review_duplicate_btn", "meta_save_btn", "library_note_save_btn", "library_tag_save_btn", "collection_add_btn", "add_to_collection_btn", "remove_collection_btn"):
+            btn = getattr(self, button_name, None)
+            if btn is None:
+                continue
+            if button_name == "run_btn":
+                set_cfg(btn, fg_color=palette["accent"], hover=False, text_color=palette["accent_text"])
+            else:
+                set_cfg(btn, fg_color=palette["button"], hover=False, text_color=palette["button_text"])
+
+        for menu_name in ("appearance_menu", "citekey_rule_menu", "library_density_menu", "collection_menu"):
+            menu = getattr(self, menu_name, None)
+            set_cfg(menu, fg_color=palette["button"], button_color=palette["button_hover"], text_color=palette["button_text"])
+
+        for label_name in ("library_left_title_label", "library_left_tip_label", "library_count_badge", "main_title_label", "main_subtitle_label", "library_left_header_label", "library_shortcut_hint", "library_details_title", "status_label"):
+            label = getattr(self, label_name, None)
+            if label is None:
+                continue
+            if label_name in ("library_count_badge", "top_status_badge"):
+                continue
+            set_cfg(label, text_color=palette["text"] if mode == "light" else getattr(label, "cget", lambda *_: None)("text_color"))
+
+        set_cfg(getattr(self, "library_left_title_label", None), text_color=palette["text"])
+        set_cfg(getattr(self, "library_left_tip_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "main_title_label", None), text_color=palette["text"])
+        set_cfg(getattr(self, "main_subtitle_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "library_details_title", None), text_color=palette["text"])
+        set_cfg(getattr(self, "library_shortcut_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "library_count_badge", None), fg_color=palette["badge_bg"], text_color=palette["badge_text"])
+
+        for label_name in ("pipeline_log_label", "pipeline_step_strip", "pipeline_log_box", "results_metrics_frame", "fixes_diff_box", "duplicates_text_box"):
+            widget = getattr(self, label_name, None)
+            if widget is not None and hasattr(widget, "configure"):
+                try:
+                    widget.configure(text_color=palette["text"])
+                except Exception:
+                    pass
+
+        for label_name in ("pipeline_log_label",):
+            label = getattr(self, label_name, None)
+            if label is not None:
+                set_cfg(label, text_color=palette["text"])
+
+        if hasattr(self, "library_tree"):
+            style = ttk.Style()
+            try:
+                style.theme_use("default")
+            except Exception:
+                pass
+            style.configure(
+                self._library_tree_style_name,
+                background=palette["tree_bg"],
+                foreground=palette["text"],
+                fieldbackground=palette["tree_bg"],
+                rowheight=26,
+                borderwidth=0,
+                relief="flat",
+                font=("Segoe UI", 10),
+            )
+            style.configure(
+                "Library.Treeview.Heading",
+                background=palette["tree_head"],
+                foreground=palette["text"],
+                relief="flat",
+                borderwidth=0,
+                font=("Segoe UI", 10, "bold"),
+            )
+            style.map(
+                self._library_tree_style_name,
+                background=[("selected", palette["tree_sel"])],
+                foreground=[("selected", palette["tree_sel_text"])],
+            )
+            set_cfg(self.library_tree, style=self._library_tree_style_name)
+
+        # Dynamic button groups keep their own active-state styling and must be refreshed after palette changes.
+        try:
+            self._update_sidebar_icon_rail()
+        except Exception:
+            pass
+        try:
+            self._update_library_left_rail()
+        except Exception:
+            pass
+        try:
+            self._update_library_scope_buttons()
+        except Exception:
+            pass
+
+        self._last_applied_theme = applied_mode
+
     def _ui_call(self, func, *args, **kwargs):
         """Run UI operation on main thread (Tkinter-safe)."""
         if threading.current_thread() is threading.main_thread():
@@ -112,7 +397,92 @@ class ModernBibGUI:
         else:
             # Queue to main thread with proper argument passing
             self.root.after(0, lambda: func(*args, **kwargs))
-        
+
+    def _suspend_window_redraw(self):
+        """Temporarily stop window redraws while doing a large visual update."""
+        if os.name != "nt":
+            return
+        self._redraw_suspend_count += 1
+        if self._redraw_suspend_count > 1:
+            return
+        try:
+            hwnd = self.root.winfo_id()
+            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 0, 0)
+        except Exception:
+            pass
+
+    def _resume_window_redraw(self):
+        """Re-enable redraws after a large visual update."""
+        if os.name != "nt":
+            return
+        if self._redraw_suspend_count == 0:
+            return
+        self._redraw_suspend_count -= 1
+        if self._redraw_suspend_count > 0:
+            return
+        try:
+            hwnd = self.root.winfo_id()
+            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 1, 0)
+            ctypes.windll.user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0080 | 0x0100)
+        except Exception:
+            pass
+
+    def _bind_tooltip(self, widget, text: str):
+        """Attach hover tooltip behavior to a widget."""
+        widget.bind("<Enter>", lambda _e, w=widget, t=text: self._schedule_tooltip(w, t), add="+")
+        widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
+        widget.bind("<ButtonPress>", lambda _e: self._hide_tooltip(), add="+")
+
+    def _schedule_tooltip(self, widget, text: str):
+        """Delay tooltip slightly to avoid visual noise when moving mouse quickly."""
+        if self._tooltip_job is not None:
+            try:
+                self.root.after_cancel(self._tooltip_job)
+            except Exception:
+                pass
+        self._tooltip_job = self.root.after(280, lambda: self._show_tooltip(widget, text))
+
+    def _show_tooltip(self, widget, text: str):
+        if self._tooltip_window is not None:
+            self._hide_tooltip()
+
+        x = widget.winfo_pointerx() + 14
+        y = widget.winfo_pointery() + 10
+
+        tip = tk.Toplevel(self.root)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            tip,
+            text=text,
+            bg="#1b2435",
+            fg="#e8effd",
+            padx=8,
+            pady=4,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+        self._tooltip_window = tip
+
+    def _hide_tooltip(self):
+        if self._tooltip_job is not None:
+            try:
+                self.root.after_cancel(self._tooltip_job)
+            except Exception:
+                pass
+            self._tooltip_job = None
+
+        if self._tooltip_window is not None:
+            try:
+                self._tooltip_window.destroy()
+            except Exception:
+                pass
+            self._tooltip_window = None
+
     def _build_ui(self):
         """Build the user interface"""
         # Configure grid
@@ -125,58 +495,100 @@ class ModernBibGUI:
         
         # Main content area with tabs
         self._build_main_content()
+
+        # Apply theme after all widgets are created, so no pane keeps construction-time colors.
+        self._apply_theme_palette(self._theme_mode)
         
     def _build_sidebar(self):
-        """Build a reference-manager style control rail."""
-        sidebar = ctk.CTkFrame(self.root, width=320, corner_radius=0, fg_color="#101218")
+        """Build a single-icon collapsible sidebar drawer for app controls."""
+        sidebar = ctk.CTkFrame(self.root, width=320, corner_radius=0)
         sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_columnconfigure(0, weight=1)
-        sidebar.grid_rowconfigure(5, weight=1)
+        self._sidebar_root = sidebar
+        self.sidebar_root = sidebar
+        sidebar.grid_columnconfigure(1, weight=1)
+        sidebar.grid_rowconfigure(1, weight=1)
+
+        icon_rail = ctk.CTkFrame(sidebar, width=52)
+        icon_rail.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 8), pady=0)
+        icon_rail.grid_propagate(False)
+        self.sidebar_icon_rail = icon_rail
+        icon_rail.grid_columnconfigure(0, weight=1)
+        icon_rail.grid_rowconfigure(6, weight=1)
 
         brand = ctk.CTkFrame(sidebar, fg_color="transparent")
-        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 12))
+        brand.grid(row=0, column=1, sticky="ew", padx=(10, 14), pady=(16, 12))
+        self._sidebar_brand = brand
+        self.sidebar_brand = brand
         brand.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             brand,
             text="Bibliography Workspace",
-            font=ctk.CTkFont(size=19, weight="bold")
+            font=ctk.CTkFont(size=18, weight="bold")
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             brand,
-            text="Collect, deduplicate, normalize, and export in one flow",
+            text="Click left icons to open tools",
             font=ctk.CTkFont(size=11),
             text_color="#8f99ab"
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        workspace_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
-        workspace_card.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        panel_host = ctk.CTkFrame(sidebar, fg_color="transparent")
+        panel_host.grid(row=1, column=1, sticky="nsew")
+        self._sidebar_panel_host = panel_host
+        self.sidebar_panel_host = panel_host
+        panel_host.grid_columnconfigure(0, weight=1)
+        panel_host.grid_rowconfigure(5, weight=1)
+
+        self.sidebar_controls_btn = ctk.CTkButton(
+            icon_rail,
+            text="☰",
+            width=34,
+            height=34,
+            corner_radius=8,
+            fg_color="transparent",
+            command=lambda: self._set_sidebar_mode("controls"),
+        )
+        self.sidebar_controls_btn.grid(row=0, column=0, padx=8, pady=(14, 8), sticky="ew")
+
+        self._sidebar_icon_buttons = {
+            "controls": self.sidebar_controls_btn,
+        }
+        self._bind_tooltip(self.sidebar_controls_btn, "Controls Drawer")
+
+        workspace_card = ctk.CTkFrame(panel_host)
+        workspace_card.grid(row=0, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
+        self.workspace_card = workspace_card
         workspace_card.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkLabel(workspace_card, text="Project Source", font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 6)
         )
 
-        self.dir_entry = ctk.CTkEntry(workspace_card, placeholder_text="Choose folder or .zip with .bib files...")
+        self.dir_entry = ctk.CTkEntry(workspace_card, placeholder_text="Choose folder, archive, .bib, or .tex source...")
         self.dir_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
 
         self.browse_btn = ctk.CTkButton(
             workspace_card,
-            text="Browse",
+            text="Folder",
             command=self._browse_directory,
-            height=30,
-            fg_color="#2b3447",
-            hover_color="#34405a"
+            height=30
         )
-        self.browse_btn.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+        self.browse_btn.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=(0, 8))
+
+        self.source_file_btn = ctk.CTkButton(
+            workspace_card,
+            text="File / Archive",
+            command=self._browse_project_source_file,
+            height=30
+        )
+        self.source_file_btn.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=(0, 8))
 
         self.demo_btn = ctk.CTkButton(
             workspace_card,
             text="Use test_data",
             command=self._use_test_data,
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30"
+            height=28
         )
         self.demo_btn.grid(row=3, column=0, sticky="ew", padx=(12, 6), pady=(0, 10))
 
@@ -184,14 +596,13 @@ class ModernBibGUI:
             workspace_card,
             text="Clear",
             command=self._clear_for_next_run,
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30"
+            height=28
         )
         self.clear_btn.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=(0, 10))
 
-        options_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
-        options_card.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+        options_card = ctk.CTkFrame(panel_host)
+        options_card.grid(row=1, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
+        self.options_card = options_card
         options_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(options_card, text="Pipeline Options", font=ctk.CTkFont(size=13, weight="bold")).grid(
@@ -232,8 +643,9 @@ class ModernBibGUI:
         self.report_check = ctk.CTkCheckBox(options_card, text="Generate HTML report", variable=self.report_var)
         self.report_check.grid(row=5, column=0, sticky="w", padx=12, pady=(0, 10))
 
-        keys_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
-        keys_card.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 10))
+        keys_card = ctk.CTkFrame(panel_host)
+        keys_card.grid(row=2, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
+        self.keys_card = keys_card
         keys_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(keys_card, text="Citation Key Policy", font=ctk.CTkFont(size=13, weight="bold")).grid(
@@ -245,8 +657,6 @@ class ModernBibGUI:
             values=["author-year-title", "author-year-titleword", "author-title", "professor-style", "professor-strict", "author-et-al-year", "lastname-only-year", "firstauthor-year-titleword", "compact-initials", "numeric", "custom"],
             variable=self.citekey_rule_var,
             command=self._on_citekey_rule_changed,
-            fg_color="#2b3447",
-            button_color="#34405a",
         )
         self.citekey_rule_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
         self.citekey_rule_menu.set("author-year-title")
@@ -268,8 +678,9 @@ class ModernBibGUI:
             font=ctk.CTkFont(size=10),
         ).grid(row=3, column=0, padx=12, pady=(0, 10), sticky="w")
 
-        actions_card = ctk.CTkFrame(sidebar, fg_color="#161b24", border_width=1, border_color="#222938")
-        actions_card.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 10))
+        actions_card = ctk.CTkFrame(panel_host)
+        actions_card.grid(row=3, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
+        self.actions_card = actions_card
         actions_card.grid_columnconfigure(0, weight=1)
 
         self.status_label = ctk.CTkLabel(
@@ -278,93 +689,140 @@ class ModernBibGUI:
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#6ab8ff",
         )
-        self.status_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 8))
+        self.status_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 10))
 
-        self.run_btn = ctk.CTkButton(
-            actions_card,
-            text="Run Full Pipeline",
-            command=self._run_pipeline,
-            height=40,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#2878ff",
-            hover_color="#1f5fcb"
-        )
-        self.run_btn.grid(row=1, column=0, padx=12, pady=(0, 6), sticky="ew")
+        appearance_card = ctk.CTkFrame(panel_host)
+        appearance_card.grid(row=4, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
+        self.appearance_card = appearance_card
+        appearance_card.grid_columnconfigure(0, weight=1)
 
-        self.cancel_btn = ctk.CTkButton(
-            actions_card,
-            text="Cancel",
-            command=self._cancel_pipeline,
-            height=30,
-            fg_color="gray25",
-            hover_color="gray30",
-            state="disabled"
-        )
-        self.cancel_btn.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
-
-        self.view_report_btn = ctk.CTkButton(
-            actions_card,
-            text="Open Report",
-            command=self._view_report,
-            height=30,
-            fg_color="gray25",
-            hover_color="gray30",
-            state="disabled"
-        )
-        self.view_report_btn.grid(row=3, column=0, padx=12, pady=(0, 10), sticky="ew")
-
-        footer = ctk.CTkFrame(sidebar, fg_color="transparent")
-        footer.grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 14))
-        footer.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(footer, text="Appearance", font=ctk.CTkFont(size=11), text_color="#8f99ab").grid(
-            row=0, column=0, sticky="w", padx=2, pady=(0, 4)
+        ctk.CTkLabel(appearance_card, text="Appearance", font=ctk.CTkFont(size=13, weight="bold"), text_color="#d2d8e5").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 6)
         )
         self.appearance_menu = ctk.CTkOptionMenu(
-            footer,
+            appearance_card,
             values=["System", "Light", "Dark"],
             command=self._change_appearance,
             fg_color="gray25",
             button_color="gray30"
         )
-        self.appearance_menu.grid(row=1, column=0, sticky="ew")
-        self.appearance_menu.set("Dark")
+        self.appearance_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+        self.appearance_menu.set("Light")
+
+        self._set_sidebar_mode("controls", force_open=True)
+
+    def _set_sidebar_mode(self, mode: Optional[str], force_open: bool = False):
+        """Toggle the single controls drawer from the left icon rail."""
+        if mode not in {None, "controls"}:
+            return
+
+        if mode is None:
+            self._sidebar_mode = None
+        else:
+            if not force_open and self._sidebar_mode == mode:
+                self._sidebar_mode = None
+            else:
+                self._sidebar_mode = mode
+
+        if self._sidebar_mode is None:
+            self._sidebar_panel_host.grid_remove()
+            self._sidebar_brand.grid_remove()
+        else:
+            self._sidebar_brand.grid(row=0, column=1, sticky="ew", padx=(10, 14), pady=(16, 12))
+            self._sidebar_panel_host.grid(row=1, column=1, sticky="nsew")
+
+        self._update_sidebar_icon_rail()
+
+    def _update_sidebar_icon_rail(self):
+        """Highlight active sidebar icon and dim inactive ones."""
+        palette = self._theme_palette(self._theme_mode)
+        for mode, btn in self._sidebar_icon_buttons.items():
+            active = mode == self._sidebar_mode
+            btn.configure(
+                fg_color=palette["button"],
+                hover=False,
+                text_color=palette["accent"] if active else palette["muted2"],
+            )
         
     def _build_main_content(self):
         """Build main content area with reference-manager style header and tabs."""
-        main_frame = ctk.CTkFrame(self.root, fg_color="#0f1218")
+        main_frame = ctk.CTkFrame(self.root)
         main_frame.grid(row=0, column=1, sticky="nsew", padx=(14, 14), pady=14)
+        self.main_frame = main_frame
         main_frame.grid_rowconfigure(1, weight=1)
         main_frame.grid_columnconfigure(0, weight=1)
 
-        header = ctk.CTkFrame(main_frame, fg_color="#161b24", border_width=1, border_color="#222938")
+        header = ctk.CTkFrame(main_frame, border_width=1)
         header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 10))
+        self.header = header
         header.grid_columnconfigure(1, weight=1)
+        header.grid_columnconfigure(2, weight=0)
 
-        ctk.CTkLabel(
+        self.main_title_label = ctk.CTkLabel(
             header,
             text="All References Workspace",
             font=ctk.CTkFont(size=17, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        )
+        self.main_title_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
 
-        ctk.CTkLabel(
+        self.main_subtitle_label = ctk.CTkLabel(
             header,
             text="Track pipeline progress, inspect duplicates, and verify fixes before export",
             font=ctk.CTkFont(size=11),
             text_color="#8f99ab"
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        )
+        self.main_subtitle_label.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
         self.top_status_badge = ctk.CTkLabel(
             header,
             textvariable=self._status_text,
             font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="#1f2937",
-            text_color="#93c5fd",
             corner_radius=8,
             padx=10,
             pady=6,
         )
-        self.top_status_badge.grid(row=0, column=1, rowspan=2, sticky="e", padx=12, pady=8)
+        self.top_status_badge.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 8), pady=8)
+
+        header_actions = ctk.CTkFrame(header, fg_color="transparent")
+        header_actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 12), pady=8)
+        self.header_actions = header_actions
+
+        self.run_btn = ctk.CTkButton(
+            header_actions,
+            text="Clean and Normalize",
+            command=self._run_pipeline,
+            height=30,
+            width=116,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.run_btn.grid(row=0, column=0, padx=(0, 6))
+
+        self.cancel_btn = ctk.CTkButton(
+            header_actions,
+            text="Cancel",
+            command=self._cancel_pipeline,
+            height=30,
+            width=80,
+            state="disabled"
+        )
+        self.cancel_btn.grid(row=0, column=1, padx=(0, 6))
+
+        self.view_report_btn = ctk.CTkButton(
+            header_actions,
+            text="Open Report",
+            command=self._view_report,
+            height=30,
+            width=100,
+            state="disabled"
+        )
+        self.view_report_btn.grid(row=0, column=2)
+
+        ctk.CTkLabel(
+            header,
+            text="Folder selection previews references. Use Clean and Normalize for full dedupe/key cleanup.",
+            font=ctk.CTkFont(size=10),
+            text_color="#8f99ab",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 8))
 
         self.tabview = ctk.CTkTabview(main_frame, corner_radius=10)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -372,7 +830,7 @@ class ModernBibGUI:
         # Create tabs
         self.tabview.add("📚 Library")
         self.tabview.add("📋 Pipeline")
-        self.tabview.add("📊 Results")
+        self.tabview.add("📈 Dashboard")
         self.tabview.add("🔍 Duplicates")
         self.tabview.add("🛠 Fixes")
         self.tabview.add("ℹ️ About")
@@ -413,113 +871,208 @@ class ModernBibGUI:
     def _build_library_tab(self):
         """Build a reference-manager style three-pane library workspace."""
         tab = self.tabview.tab("📚 Library")
+        self._library_tab = tab
+        self.library_tab = tab
+        control_h = 30
+        side_pad = 10
+        palette = self._theme_palette(self._theme_mode)
+        pane_left_bg = palette["card"]
+        pane_center_bg = palette["card"]
+        pane_right_bg = palette["card"]
+        card_bg = palette["card"]
+        text_primary = palette["text"]
+        text_secondary = palette["muted"]
+        neutral_btn = palette["button"]
+        neutral_btn_hover = palette["button_hover"]
+
         tab.grid_rowconfigure(0, weight=1)
-        tab.grid_columnconfigure(1, weight=3)
-        tab.grid_columnconfigure(2, weight=2)
+        tab.grid_columnconfigure(0, weight=2, minsize=220)
+        tab.grid_columnconfigure(1, weight=7)
+        tab.grid_columnconfigure(2, weight=5)
 
-        left = ctk.CTkFrame(tab, fg_color="#141922")
-        left.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=10)
-        left.grid_columnconfigure(0, weight=1)
+        left_shell = ctk.CTkFrame(tab, fg_color="transparent")
+        left_shell.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=10)
+        self._library_left_shell = left_shell
+        self.library_left_shell = left_shell
+        left_shell.grid_columnconfigure(1, weight=1)
+        left_shell.grid_rowconfigure(0, weight=1)
 
-        ctk.CTkLabel(left, text="Library", font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(10, 8)
+        icon_rail = ctk.CTkFrame(left_shell, fg_color=palette["icon_rail"], width=48)
+        icon_rail.grid(row=0, column=0, sticky="nsw", padx=(0, 6))
+        icon_rail.grid_propagate(False)
+        self.library_icon_rail = icon_rail
+        icon_rail.grid_columnconfigure(0, weight=1)
+        icon_rail.grid_rowconfigure(4, weight=1)
+
+        self.library_nav_scopes_btn = ctk.CTkButton(
+            icon_rail,
+            text="📚",
+            width=34,
+            height=34,
+            corner_radius=8,
+            fg_color="transparent",
+            hover=False,
+            command=lambda: self._set_library_left_mode("scopes"),
         )
+        self.library_nav_scopes_btn.grid(row=0, column=0, padx=6, pady=(10, 6), sticky="ew")
 
-        scopes = ["All References", "Recently Added", "Favorites", "Duplicate Items"]
-        for idx, scope in enumerate(scopes, start=1):
-            btn = ctk.CTkButton(
-                left,
-                text=scope,
-                height=30,
-                fg_color="transparent",
-                hover_color="#263247",
-                anchor="w",
-                command=lambda s=scope: self._set_library_scope(s),
-            )
-            btn.grid(row=idx, column=0, sticky="ew", padx=8, pady=2)
-            self._library_scope_buttons[scope] = btn
+        self.library_nav_collections_btn = ctk.CTkButton(
+            icon_rail,
+            text="🗂",
+            width=34,
+            height=34,
+            corner_radius=8,
+            fg_color="transparent",
+            hover=False,
+            command=lambda: self._set_library_left_mode("collections"),
+        )
+        self.library_nav_collections_btn.grid(row=1, column=0, padx=6, pady=6, sticky="ew")
+        self._library_left_icon_buttons = {
+            "scopes": self.library_nav_scopes_btn,
+            "collections": self.library_nav_collections_btn,
+        }
+        self._bind_tooltip(self.library_nav_scopes_btn, "Library Scopes")
+        self._bind_tooltip(self.library_nav_collections_btn, "Collections")
 
-        ctk.CTkLabel(
+        left = ctk.CTkFrame(left_shell, fg_color=pane_left_bg, width=230)
+        left.grid(row=0, column=1, sticky="nsew")
+        self._library_left_content = left
+        self.library_left_frame = left
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(2, weight=1)
+
+        self.library_left_title_label = ctk.CTkLabel(
             left,
-            text="Tip: run pipeline first, then browse entries here.",
-            text_color="#8693aa",
+            text="Library Scopes",
+            text_color=text_primary,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        self.library_left_title_label.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+        self.library_left_tip_label = ctk.CTkLabel(
+            left,
+            text="Tip: choose a folder to preview references instantly.",
+            text_color=text_secondary,
             font=ctk.CTkFont(size=10),
             wraplength=180,
             justify="left",
-        ).grid(row=6, column=0, sticky="w", padx=10, pady=(12, 10))
-
-        ctk.CTkLabel(left, text="Collections", font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=7, column=0, sticky="w", padx=10, pady=(6, 4)
         )
-        collection_row = ctk.CTkFrame(left, fg_color="transparent")
-        collection_row.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.library_left_tip_label.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        self.library_scopes_panel = ctk.CTkFrame(left, fg_color="transparent")
+        self.library_scopes_panel.grid(row=2, column=0, sticky="nsew", padx=side_pad, pady=(0, 8))
+        self.library_scopes_panel.grid_columnconfigure(0, weight=1)
+        self.library_scopes_panel.grid_rowconfigure(5, weight=1)
+
+        scopes = ["All References", "Recently Added", "Favorites", "Duplicate Items"]
+        for idx, scope in enumerate(scopes):
+            btn = ctk.CTkButton(
+                self.library_scopes_panel,
+                text=scope,
+                height=control_h,
+                fg_color="transparent",
+                hover_color=palette["button_hover"],
+                text_color=palette["text"],
+                anchor="w",
+                command=lambda s=scope: self._set_library_scope(s),
+            )
+            btn.grid(row=idx, column=0, sticky="ew", pady=2)
+            self._library_scope_buttons[scope] = btn
+
+        self.library_collections_panel = ctk.CTkFrame(left, fg_color="transparent")
+        self.library_collections_panel.grid(row=2, column=0, sticky="nsew", padx=side_pad, pady=(0, 8))
+        self.library_collections_panel.grid_columnconfigure(0, weight=1)
+        self.library_collections_panel.grid_rowconfigure(4, weight=1)
+
+        collection_row = ctk.CTkFrame(self.library_collections_panel, fg_color="transparent")
+        collection_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         collection_row.grid_columnconfigure(0, weight=1)
 
         self.collection_name_var = ctk.StringVar(value="")
         self.collection_entry = ctk.CTkEntry(collection_row, textvariable=self.collection_name_var, placeholder_text="New collection")
         self.collection_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.collection_add_btn = ctk.CTkButton(collection_row, text="Add", width=50, height=28, command=self._add_collection)
+        self.collection_add_btn = ctk.CTkButton(collection_row, text="Add", width=50, height=control_h, command=self._add_collection)
         self.collection_add_btn.grid(row=0, column=1, sticky="e")
 
         self.collection_menu = ctk.CTkOptionMenu(
-            left,
+            self.library_collections_panel,
             values=["No collections"],
             command=self._on_collection_selected,
-            fg_color="gray23",
-            button_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            button_color=neutral_btn_hover,
         )
-        self.collection_menu.grid(row=9, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self.collection_menu.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.collection_menu.set("No collections")
 
-        collection_actions = ctk.CTkFrame(left, fg_color="transparent")
-        collection_actions.grid(row=10, column=0, sticky="ew", padx=8, pady=(0, 10))
+        collection_actions = ctk.CTkFrame(self.library_collections_panel, fg_color="transparent")
+        collection_actions.grid(row=2, column=0, sticky="ew")
         collection_actions.grid_columnconfigure((0, 1), weight=1)
         self.add_to_collection_btn = ctk.CTkButton(
             collection_actions,
             text="Add selected",
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            hover=False,
             command=self._add_selected_to_active_collection,
         )
         self.add_to_collection_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.remove_collection_btn = ctk.CTkButton(
             collection_actions,
             text="Remove",
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            hover=False,
             command=self._remove_active_collection,
         )
         self.remove_collection_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
-        center = ctk.CTkFrame(tab, fg_color="#141922")
+        self._set_library_left_mode(None, force_open=True)
+
+        center = ctk.CTkFrame(tab, fg_color=pane_center_bg)
         center.grid(row=0, column=1, sticky="nsew", padx=(0, 6), pady=10)
-        center.grid_rowconfigure(1, weight=1)
+        self.library_center_frame = center
+        center.grid_rowconfigure(3, weight=1)
         center.grid_columnconfigure(0, weight=1)
 
         top = ctk.CTkFrame(center, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
-        top.grid_columnconfigure(1, weight=1)
+        self.library_top_frame = top
+        top.grid_columnconfigure(0, weight=0)
+        top.grid_columnconfigure(1, weight=0)
         top.grid_columnconfigure(2, weight=0)
+        top.grid_columnconfigure(3, weight=1)
 
-        ctk.CTkLabel(top, text="All References", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(top, text="All References", text_color=text_primary, font=ctk.CTkFont(size=15, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=(0, 8)
         )
 
+        self.library_count_badge = ctk.CTkLabel(
+            top,
+            text="0 refs",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            corner_radius=8,
+            padx=8,
+            pady=3,
+        )
+        self.library_count_badge.grid(row=0, column=1, sticky="w", padx=(0, 8))
+
         self.library_search_var = ctk.StringVar(value="")
         search_entry = ctk.CTkEntry(top, textvariable=self.library_search_var, placeholder_text="Search title, author, year, key...")
-        search_entry.grid(row=0, column=1, sticky="ew")
+        search_entry.configure(height=control_h)
+        search_entry.grid(row=0, column=3, sticky="ew")
         search_entry.bind("<KeyRelease>", lambda _e: self._apply_library_filter())
+        self.library_search_entry = search_entry
 
         toolbar = ctk.CTkFrame(top, fg_color="transparent")
-        toolbar.grid(row=0, column=2, padx=(8, 0), sticky="e")
+        toolbar.grid(row=1, column=0, columnspan=4, pady=(8, 0), sticky="w")
+        self.library_toolbar_frame = toolbar
 
-        self.library_add_btn = ctk.CTkButton(toolbar, text="Add", width=58, height=28, command=self._add_library_entry_manual)
+        self.library_add_btn = ctk.CTkButton(toolbar, text="Add", width=58, height=control_h, command=self._add_library_entry_manual)
         self.library_add_btn.grid(row=0, column=0, padx=(0, 4))
-        self.library_delete_btn = ctk.CTkButton(toolbar, text="Delete", width=58, height=28, fg_color="gray23", hover_color="gray30", command=self._delete_selected_library_entry)
+        self.library_delete_btn = ctk.CTkButton(toolbar, text="Delete", width=58, height=control_h, command=self._delete_selected_library_entry)
         self.library_delete_btn.grid(row=0, column=1, padx=(0, 4))
-        self.library_export_btn = ctk.CTkButton(toolbar, text="Export", width=62, height=28, fg_color="gray23", hover_color="gray30", command=self._export_selected_library_entry)
+        self.library_export_btn = ctk.CTkButton(toolbar, text="Export", width=62, height=control_h, command=self._export_selected_library_entry)
         self.library_export_btn.grid(row=0, column=2, padx=(0, 6))
 
         self.library_density_menu = ctk.CTkOptionMenu(
@@ -528,13 +1081,27 @@ class ModernBibGUI:
             variable=self._library_density_var,
             command=self._change_library_density,
             width=116,
-            fg_color="gray23",
-            button_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            button_color=neutral_btn_hover,
         )
         self.library_density_menu.grid(row=0, column=3)
 
+        self.library_delete_btn.configure(fg_color=neutral_btn, hover_color=neutral_btn_hover)
+        self.library_export_btn.configure(fg_color=neutral_btn, hover_color=neutral_btn_hover)
+
+        self.library_shortcut_hint = ctk.CTkLabel(
+            center,
+            text="Shortcuts: Ctrl+F search   Ctrl+C copy key   Ctrl+D delete   Ctrl+M favorite",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=10),
+        )
+        self.library_shortcut_hint.grid(row=1, column=0, sticky="w", padx=10, pady=(2, 2))
+
         filters = ctk.CTkFrame(center, fg_color="transparent")
-        filters.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        filters.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.library_filters_frame = filters
+        filters.grid_columnconfigure((0, 1, 2), weight=0)
         self.filter_duplicates_var = ctk.BooleanVar(value=False)
         self.filter_doi_var = ctk.BooleanVar(value=False)
         self.filter_missing_year_var = ctk.BooleanVar(value=False)
@@ -569,8 +1136,9 @@ class ModernBibGUI:
         )
         self.filter_missing_year_chip.grid(row=0, column=2, padx=(0, 8), pady=0, sticky="w")
 
-        tree_frame = ctk.CTkFrame(center, fg_color="#10151d")
-        tree_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        tree_frame = ctk.CTkFrame(center, fg_color=card_bg)
+        tree_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.library_tree_frame = tree_frame
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
@@ -581,9 +1149,9 @@ class ModernBibGUI:
             pass
         style.configure(
             self._library_tree_style_name,
-            background="#111826",
-            foreground="#dbe4f5",
-            fieldbackground="#111826",
+            background=palette["tree_bg"],
+            foreground=palette["text"],
+            fieldbackground=palette["tree_bg"],
             rowheight=26,
             borderwidth=0,
             relief="flat",
@@ -591,16 +1159,16 @@ class ModernBibGUI:
         )
         style.configure(
             "Library.Treeview.Heading",
-            background="#1a2333",
-            foreground="#c6d4ec",
+            background=palette["tree_head"],
+            foreground=palette["text"],
             relief="flat",
             borderwidth=0,
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
             self._library_tree_style_name,
-            background=[("selected", "#264976")],
-            foreground=[("selected", "#ffffff")],
+            background=[("selected", palette["tree_sel"])],
+            foreground=[("selected", palette["tree_sel_text"])],
         )
 
         self.library_tree = ttk.Treeview(
@@ -624,8 +1192,10 @@ class ModernBibGUI:
         self.library_tree.column("source", width=150, anchor="w")
         self.library_tree.column("key", width=150, anchor="w")
 
-        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.library_tree.yview)
-        x_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.library_tree.xview)
+        y_scroll = ctk.CTkScrollbar(tree_frame, orientation="vertical", command=self.library_tree.yview)
+        x_scroll = ctk.CTkScrollbar(tree_frame, orientation="horizontal", command=self.library_tree.xview)
+        self.library_tree_y_scroll = y_scroll
+        self.library_tree_x_scroll = x_scroll
         self.library_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
         self.library_tree.grid(row=0, column=0, sticky="nsew")
@@ -637,48 +1207,50 @@ class ModernBibGUI:
         self.library_tree.bind("<Button-3>", self._show_library_context_menu)
         self._bind_library_shortcuts(search_entry)
 
-        right = ctk.CTkFrame(tab, fg_color="#141922")
+        right = ctk.CTkFrame(tab, fg_color=pane_right_bg)
         right.grid(row=0, column=2, sticky="nsew", padx=(0, 10), pady=10)
+        self.library_right_frame = right
         right.grid_rowconfigure(2, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(right, text="Details", font=ctk.CTkFont(size=14, weight="bold")).grid(
+        ctk.CTkLabel(right, text="Details", text_color=text_primary, font=ctk.CTkFont(size=15, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=10, pady=(10, 8)
         )
 
         detail_actions = ctk.CTkFrame(right, fg_color="transparent")
         detail_actions.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
-        detail_actions.grid_columnconfigure((0, 1, 2), weight=1)
+        self.library_detail_actions = detail_actions
+        detail_actions.grid_columnconfigure(0, weight=1)
 
         self.copy_key_btn = ctk.CTkButton(
             detail_actions,
-            text="Copy Key (Ctrl+C)",
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30",
+            text="Copy Key",
+            height=control_h,
+            fg_color=neutral_btn,
+            hover=False,
             command=self._copy_selected_key,
         )
-        self.copy_key_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.copy_key_btn.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
         self.add_selected_btn = ctk.CTkButton(
             detail_actions,
             text="Add to Collection",
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            hover=False,
             command=self._add_selected_to_active_collection,
         )
-        self.add_selected_btn.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.add_selected_btn.grid(row=1, column=0, sticky="ew", pady=(0, 4))
 
         self.review_duplicate_btn = ctk.CTkButton(
             detail_actions,
             text="Review Duplicates",
-            height=28,
-            fg_color="gray23",
-            hover_color="gray30",
+            height=control_h,
+            fg_color=neutral_btn,
+            hover=False,
             command=self._review_selected_duplicates,
         )
-        self.review_duplicate_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.review_duplicate_btn.grid(row=2, column=0, sticky="ew")
 
         self.library_details_tabs = ctk.CTkTabview(right)
         self.library_details_tabs.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -690,13 +1262,14 @@ class ModernBibGUI:
         info_tab.grid_rowconfigure(0, weight=1)
         info_tab.grid_rowconfigure(1, weight=0)
         info_tab.grid_columnconfigure(0, weight=1)
-        self.library_info_text = ctk.CTkTextbox(info_tab, font=ctk.CTkFont(family="Consolas", size=11), wrap="word")
+        self.library_info_text = ctk.CTkTextbox(info_tab, font=ctk.CTkFont(family="Segoe UI", size=11), wrap="word")
         self.library_info_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.library_info_text.insert("1.0", "Run pipeline, then select a reference to view metadata.")
+        self.library_info_text.insert("1.0", "Choose a folder, then select a reference to view metadata.")
 
-        edit_box = ctk.CTkFrame(info_tab, fg_color="#10151d")
+        edit_box = ctk.CTkFrame(info_tab, fg_color=card_bg)
         edit_box.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
-        for col in range(4):
+        self.library_metadata_frame = edit_box
+        for col in range(2):
             edit_box.grid_columnconfigure(col, weight=1)
 
         self.meta_author_var = ctk.StringVar(value="")
@@ -707,25 +1280,30 @@ class ModernBibGUI:
 
         ctk.CTkLabel(edit_box, text="Author", font=ctk.CTkFont(size=10)).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
         ctk.CTkLabel(edit_box, text="Year", font=ctk.CTkFont(size=10)).grid(row=0, column=1, sticky="w", padx=6, pady=(6, 0))
-        ctk.CTkLabel(edit_box, text="Source", font=ctk.CTkFont(size=10)).grid(row=0, column=2, sticky="w", padx=6, pady=(6, 0))
-        ctk.CTkLabel(edit_box, text="DOI", font=ctk.CTkFont(size=10)).grid(row=0, column=3, sticky="w", padx=6, pady=(6, 0))
+        self.meta_author_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_author_var, height=control_h)
+        self.meta_author_entry.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_year_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_year_var, height=control_h)
+        self.meta_year_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 4))
 
-        ctk.CTkEntry(edit_box, textvariable=self.meta_author_var).grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
-        ctk.CTkEntry(edit_box, textvariable=self.meta_year_var).grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 4))
-        ctk.CTkEntry(edit_box, textvariable=self.meta_source_var).grid(row=1, column=2, sticky="ew", padx=6, pady=(0, 4))
-        ctk.CTkEntry(edit_box, textvariable=self.meta_doi_var).grid(row=1, column=3, sticky="ew", padx=6, pady=(0, 4))
+        ctk.CTkLabel(edit_box, text="Source", font=ctk.CTkFont(size=10)).grid(row=2, column=0, sticky="w", padx=6, pady=(0, 0))
+        ctk.CTkLabel(edit_box, text="DOI", font=ctk.CTkFont(size=10)).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 0))
+        self.meta_source_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_source_var, height=control_h)
+        self.meta_source_entry.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_doi_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_doi_var, height=control_h)
+        self.meta_doi_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=(0, 4))
 
-        ctk.CTkLabel(edit_box, text="Title", font=ctk.CTkFont(size=10)).grid(row=2, column=0, sticky="w", padx=6, pady=(0, 0))
-        ctk.CTkEntry(edit_box, textvariable=self.meta_title_var).grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
-        self.meta_save_btn = ctk.CTkButton(edit_box, text="Save Metadata", height=26, command=self._save_selected_metadata)
-        self.meta_save_btn.grid(row=3, column=3, sticky="ew", padx=6, pady=(0, 6))
+        ctk.CTkLabel(edit_box, text="Title", font=ctk.CTkFont(size=10)).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 0))
+        self.meta_title_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_title_var, height=control_h)
+        self.meta_title_entry.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.meta_save_btn = ctk.CTkButton(edit_box, text="Save Metadata", height=control_h, command=self._save_selected_metadata)
+        self.meta_save_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
 
         notes_tab = self.library_details_tabs.tab("Notes")
         notes_tab.grid_rowconfigure(0, weight=1)
         notes_tab.grid_columnconfigure(0, weight=1)
         self.library_notes_text = ctk.CTkTextbox(notes_tab, font=ctk.CTkFont(size=11), wrap="word")
         self.library_notes_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
-        self.library_note_save_btn = ctk.CTkButton(notes_tab, text="Save Note", height=26, command=self._save_selected_note)
+        self.library_note_save_btn = ctk.CTkButton(notes_tab, text="Save Note", height=control_h, command=self._save_selected_note)
         self.library_note_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
 
         tags_tab = self.library_details_tabs.tab("Tags")
@@ -733,26 +1311,83 @@ class ModernBibGUI:
         tags_tab.grid_columnconfigure(0, weight=1)
         self.library_tags_text = ctk.CTkTextbox(tags_tab, font=ctk.CTkFont(size=11), wrap="word")
         self.library_tags_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
-        self.library_tag_save_btn = ctk.CTkButton(tags_tab, text="Save Tags", height=26, command=self._save_selected_tags)
+        self.library_tag_save_btn = ctk.CTkButton(tags_tab, text="Save Tags", height=control_h, command=self._save_selected_tags)
         self.library_tag_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
 
         self._update_library_scope_buttons()
 
+    def _set_library_left_mode(self, mode: Optional[str], force_open: bool = False):
+        """Toggle Library drawer between Scopes/Collections, collapse on repeat click."""
+        if mode is not None and mode not in {"scopes", "collections"}:
+            return
+
+        if mode is None:
+            self._library_left_mode = None
+        else:
+            if not force_open and self._library_left_mode == mode:
+                self._library_left_mode = None
+            else:
+                self._library_left_mode = mode
+
+        if not hasattr(self, 'library_scopes_panel') or not hasattr(self, 'library_collections_panel'):
+            return
+
+        self.library_scopes_panel.grid_forget()
+        self.library_collections_panel.grid_forget()
+
+        self._library_left_content.grid(row=0, column=1, sticky="nsew")
+        if self._library_left_mode is None:
+            if hasattr(self, "_library_tab"):
+                self._library_tab.grid_columnconfigure(0, weight=0, minsize=52)
+            self.library_left_title_label.configure(text="Library Scopes")
+            self.library_left_tip_label.configure(text="Choose a scope to focus your reference list.")
+            self.library_scopes_panel.grid_remove()
+            self.library_collections_panel.grid_remove()
+            self._library_left_content.grid_remove()
+        elif self._library_left_mode == "scopes":
+            if hasattr(self, "_library_tab"):
+                self._library_tab.grid_columnconfigure(0, weight=2, minsize=220)
+            self.library_left_title_label.configure(text="Library Scopes")
+            self.library_left_tip_label.configure(text="Choose a scope to focus your reference list.")
+            self.library_scopes_panel.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        else:
+            if hasattr(self, "_library_tab"):
+                self._library_tab.grid_columnconfigure(0, weight=2, minsize=220)
+            self.library_left_title_label.configure(text="Collections")
+            self.library_left_tip_label.configure(text="Create named groups and quickly add selected references.")
+            self.library_collections_panel.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 8))
+
+        self._update_library_left_rail()
+
+    def _update_library_left_rail(self):
+        """Highlight active icon in Library side rail."""
+        palette = self._theme_palette(self._theme_mode)
+        for mode, btn in self._library_left_icon_buttons.items():
+            active = mode == self._library_left_mode
+            btn.configure(
+                fg_color=palette["button"],
+                hover=False,
+                text_color=palette["accent"] if active else palette["muted2"],
+            )
+
     def _set_library_scope(self, scope: str):
         self._library_scope = scope
         self._active_collection_name = None
+        self._set_library_left_mode("scopes", force_open=True)
         self._update_library_scope_buttons()
         self._apply_library_filter()
 
     def _update_library_scope_buttons(self):
+        palette = self._theme_palette(self._theme_mode)
         counts = self._library_scope_counts()
         for scope, btn in self._library_scope_buttons.items():
             active = scope == self._library_scope
             count = counts.get(scope, 0)
             btn.configure(
                 text=f"{scope} ({count})",
-                fg_color="#2b3a54" if active else "transparent",
-                text_color="#dbeafe" if active else "#c8d0df",
+                fg_color=palette["button"],
+                hover=False,
+                text_color=palette["accent"] if active else palette["muted2"],
             )
 
     def _library_scope_counts(self) -> dict[str, int]:
@@ -791,6 +1426,7 @@ class ModernBibGUI:
         if name not in self._custom_collections:
             self._custom_collections[name] = set()
         self._active_collection_name = name
+        self._set_library_left_mode("collections", force_open=True)
         self._refresh_collection_menu()
         self.collection_name_var.set("")
 
@@ -802,6 +1438,7 @@ class ModernBibGUI:
         if selection in self._custom_collections:
             self._active_collection_name = selection
             self._library_scope = "Collection"
+            self._set_library_left_mode("collections", force_open=True)
             self._update_library_scope_buttons()
             self._apply_library_filter()
 
@@ -1127,6 +1764,13 @@ class ModernBibGUI:
     def _refresh_library_tree(self):
         if not hasattr(self, 'library_tree'):
             return
+
+        if hasattr(self, 'library_count_badge'):
+            shown = len(self._library_filtered_entries)
+            total = len(self._library_entries)
+            badge_text = f"{shown}/{total} refs" if total else "0 refs"
+            self.library_count_badge.configure(text=badge_text)
+
         for item in self.library_tree.get_children():
             self.library_tree.delete(item)
 
@@ -1228,12 +1872,14 @@ class ModernBibGUI:
     def _build_pipeline_tab(self):
         """Build pipeline execution tab with step cards"""
         tab = self.tabview.tab("📋 Pipeline")
+        self.pipeline_tab = tab
         tab.grid_rowconfigure(2, weight=1)
         tab.grid_columnconfigure(0, weight=1)
         
         # Steps timeline section
         steps_section = ctk.CTkFrame(tab, fg_color="transparent")
         steps_section.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        self.pipeline_steps_section = steps_section
         steps_section.grid_columnconfigure((0, 1, 2, 3), weight=1)
         
         # Define pipeline steps with emojis
@@ -1294,8 +1940,9 @@ class ModernBibGUI:
             self.step_timers[step_name] = 0.0
         
         # Compact current step strip
-        step_strip = ctk.CTkFrame(tab, fg_color="#141414", corner_radius=6)
+        step_strip = ctk.CTkFrame(tab, corner_radius=6)
         step_strip.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+        self.pipeline_step_strip = step_strip
         step_strip.grid_columnconfigure(1, weight=1)
 
         detail_label = ctk.CTkLabel(step_strip, text="Current:",
@@ -1317,6 +1964,7 @@ class ModernBibGUI:
         log_label = ctk.CTkLabel(tab, text="📋 Pipeline Log",
                                 font=ctk.CTkFont(size=11, weight="bold"))
         log_label.grid(row=2, column=0, sticky="w", padx=10, pady=(6, 4))
+        self.pipeline_log_label = log_label
         
         self.log_text = ctk.CTkTextbox(
             tab,
@@ -1325,93 +1973,159 @@ class ModernBibGUI:
         )
         self.log_text.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
         tab.grid_rowconfigure(3, weight=1)
+        self.pipeline_log_box = self.log_text
         
     def _build_results_tab(self):
-        """Build results summary tab with visual metrics"""
-        tab = self.tabview.tab("📊 Results")
+        """Build the post-run dashboard surface."""
+        tab = self.tabview.tab("📈 Dashboard")
+        self.results_tab = tab
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
-        
-        # Main stats in a scrollable frame
+
+        self.results_hero_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self.results_hero_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        self.results_hero_frame.grid_columnconfigure(0, weight=1)
+
+        self.results_title_label = ctk.CTkLabel(
+            self.results_hero_frame,
+            text="Post-run dashboard",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        )
+        self.results_title_label.grid(row=0, column=0, sticky="w")
+
+        self.results_subtitle_label = ctk.CTkLabel(
+            self.results_hero_frame,
+            text="This view translates the pipeline into file, folder, and citation changes you can inspect.",
+            font=ctk.CTkFont(size=10),
+            text_color="#8f99ab",
+        )
+        self.results_subtitle_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        self.results_scope_label = ctk.CTkLabel(
+            self.results_hero_frame,
+            text="No run yet",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#94a3b8",
+        )
+        self.results_scope_label.grid(row=0, column=1, rowspan=2, sticky="e")
+
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        scroll.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.results_scroll = scroll
         scroll.grid_columnconfigure((0, 1), weight=1)
-        
-        # Create enhanced stat cards in grid (2 columns)
-        stats = [
-            ("📁 Files", "files", "Total .bib files scanned"),
-            ("📝 Initial Entries", "initial", "Starting bibliography size"),
-            ("🔄 Duplicate Groups", "groups", "Number of duplicate clusters"),
-            ("🗑️ Entries Removed", "removed", "Duplicate entries deleted"),
-            ("✅ Final Entries", "final", "Cleaned bibliography size"),
-            ("⚡ Processing Time", "time", "Total runtime")
-        ]
-        
+
         self.stat_labels = {}
-        self.stat_bars = {}  # For progress bars
-        
+        self.stat_bars = {}
+        stats = [
+            ("📁 Files Scanned", "files", "Total .bib files discovered"),
+            ("🗂 Folders Scanned", "folders", "Unique folders containing bibliography files"),
+            ("📝 Initial Entries", "initial", "Entries before cleanup"),
+            ("🔄 Duplicate Groups", "groups", "Clusters found during matching"),
+            ("🗑️ Entries Removed", "removed", "Redundant entries dropped"),
+            ("✅ Final Entries", "final", "Unique entries kept"),
+            ("🔑 Keys Normalized", "keys", "Citation labels rewritten"),
+            ("⚡ Processing Time", "time", "Total runtime"),
+        ]
+
         for idx, (label, key, description) in enumerate(stats):
             row = idx // 2
             col = idx % 2
-            
-            card = ctk.CTkFrame(scroll, fg_color="#1a1a1a", corner_radius=8)
+            card = ctk.CTkFrame(scroll, corner_radius=8)
             card.grid(row=row, column=col, padx=8, pady=8, sticky="ew")
             card.grid_columnconfigure(0, weight=1)
-            
-            # Title and value row
+
             header_frame = ctk.CTkFrame(card, fg_color="transparent")
             header_frame.pack(fill="x", padx=12, pady=(12, 6))
             header_frame.grid_columnconfigure(0, weight=1)
-            
+
             title = ctk.CTkLabel(header_frame, text=label, font=ctk.CTkFont(size=12, weight="bold"))
             title.grid(row=0, column=0, sticky="w")
-            
+
             value = ctk.CTkLabel(header_frame, text="—", font=ctk.CTkFont(size=20, weight="bold"), text_color="#4ade80")
             value.grid(row=0, column=1, sticky="e")
-            
+
             self.stat_labels[key] = value
-            
-            # Description
+
             desc = ctk.CTkLabel(card, text=description, font=ctk.CTkFont(size=10), text_color="#888888")
             desc.pack(fill="x", padx=12, pady=(0, 8))
-        
-        # Key metrics display
-        metrics_frame = ctk.CTkFrame(scroll, fg_color="#1a1a1a", corner_radius=8)
-        metrics_frame.grid(row=3, column=0, columnspan=2, padx=8, pady=8, sticky="ew")
-        metrics_frame.grid_columnconfigure(0, weight=1)
-        
-        metrics_title = ctk.CTkLabel(metrics_frame, text="📊 Key Metrics", font=ctk.CTkFont(size=12, weight="bold"))
-        metrics_title.pack(fill="x", padx=12, pady=(12, 8))
-        
-        # Reduction rate bar
-        rate_label = ctk.CTkLabel(metrics_frame, text="Reduction Rate", font=ctk.CTkFont(size=10))
-        rate_label.pack(fill="x", padx=12)
-        
-        self.reduction_bar = ctk.CTkProgressBar(metrics_frame)
-        self.reduction_bar.pack(fill="x", padx=12, pady=(4, 2))
+
+        self.results_metrics_frame = ctk.CTkFrame(scroll, corner_radius=8)
+        self.results_metrics_frame.grid(row=4, column=0, columnspan=2, padx=8, pady=8, sticky="ew")
+        self.results_metrics_frame.grid_columnconfigure((0, 1), weight=1)
+
+        metrics_title = ctk.CTkLabel(self.results_metrics_frame, text="What changed", font=ctk.CTkFont(size=12, weight="bold"))
+        metrics_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        reduction_frame = ctk.CTkFrame(self.results_metrics_frame, fg_color="transparent")
+        reduction_frame.grid(row=1, column=0, sticky="ew", padx=(12, 8), pady=(0, 12))
+        reduction_frame.grid_columnconfigure(0, weight=1)
+
+        rate_label = ctk.CTkLabel(reduction_frame, text="Duplicate reduction", font=ctk.CTkFont(size=10))
+        rate_label.pack(fill="x")
+
+        self.reduction_bar = ctk.CTkProgressBar(reduction_frame)
+        self.reduction_bar.pack(fill="x", pady=(4, 2))
         self.reduction_bar.set(0)
-        
-        self.reduction_text = ctk.CTkLabel(metrics_frame, text="0%", font=ctk.CTkFont(size=10, weight="bold"), text_color="#fbbf24")
-        self.reduction_text.pack(fill="x", padx=12, pady=(0, 2))
-        
-        # Normalized keys indicator
-        keys_label = ctk.CTkLabel(metrics_frame, text="Citation Keys Normalized", font=ctk.CTkFont(size=10))
-        keys_label.pack(fill="x", padx=12, pady=(8, 2))
-        
-        self.keys_bar = ctk.CTkProgressBar(metrics_frame)
-        self.keys_bar.pack(fill="x", padx=12, pady=(4, 2))
+
+        self.reduction_text = ctk.CTkLabel(reduction_frame, text="0%", font=ctk.CTkFont(size=10, weight="bold"), text_color="#fbbf24")
+        self.reduction_text.pack(fill="x")
+
+        keys_frame = ctk.CTkFrame(self.results_metrics_frame, fg_color="transparent")
+        keys_frame.grid(row=1, column=1, sticky="ew", padx=(8, 12), pady=(0, 12))
+        keys_frame.grid_columnconfigure(0, weight=1)
+
+        keys_label = ctk.CTkLabel(keys_frame, text="Citation keys normalized", font=ctk.CTkFont(size=10))
+        keys_label.pack(fill="x")
+
+        self.keys_bar = ctk.CTkProgressBar(keys_frame)
+        self.keys_bar.pack(fill="x", pady=(4, 2))
         self.keys_bar.set(0)
-        
-        self.keys_text = ctk.CTkLabel(metrics_frame, text="0 keys", font=ctk.CTkFont(size=10, weight="bold"), text_color="#60a5fa")
-        self.keys_text.pack(fill="x", padx=12, pady=(0, 12))
-        
-        # Details textbox
-        self.results_text = ctk.CTkTextbox(tab, font=ctk.CTkFont(size=12))
-        self.results_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        self.keys_text = ctk.CTkLabel(keys_frame, text="0 keys", font=ctk.CTkFont(size=10, weight="bold"), text_color="#60a5fa")
+        self.keys_text.pack(fill="x")
+
+        insights = ctk.CTkFrame(scroll, fg_color="transparent")
+        insights.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=0, pady=(4, 0))
+        insights.grid_columnconfigure((0, 1), weight=1)
+
+        self.results_summary_frame = ctk.CTkFrame(insights, corner_radius=8)
+        self.results_summary_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        self.results_summary_frame.grid_columnconfigure(0, weight=1)
+
+        summary_header = ctk.CTkLabel(self.results_summary_frame, text="Executive summary", font=ctk.CTkFont(size=12, weight="bold"))
+        summary_header.pack(fill="x", padx=12, pady=(12, 8))
+
+        self.results_text = ctk.CTkTextbox(self.results_summary_frame, font=ctk.CTkFont(size=12), wrap="word", height=220)
+        self.results_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.results_text_box = self.results_text
+        self.results_text.insert("1.0", "Run the pipeline to see a summary of what changed.")
+
+        self.results_files_frame = ctk.CTkFrame(insights, corner_radius=8)
+        self.results_files_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        self.results_files_frame.grid_columnconfigure(0, weight=1)
+
+        files_header = ctk.CTkLabel(self.results_files_frame, text="Most impacted files", font=ctk.CTkFont(size=12, weight="bold"))
+        files_header.pack(fill="x", padx=12, pady=(12, 8))
+
+        self.results_files_box = ctk.CTkTextbox(self.results_files_frame, font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=220)
+        self.results_files_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.results_files_box.insert("1.0", "Changed files will appear here after a run.")
+
+        self.results_folders_frame = ctk.CTkFrame(scroll, corner_radius=8)
+        self.results_folders_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", padx=8, pady=(0, 8))
+        self.results_folders_frame.grid_columnconfigure(0, weight=1)
+
+        folders_header = ctk.CTkLabel(self.results_folders_frame, text="Folders touched", font=ctk.CTkFont(size=12, weight="bold"))
+        folders_header.pack(fill="x", padx=12, pady=(12, 8))
+
+        self.results_folders_box = ctk.CTkTextbox(self.results_folders_frame, font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=180)
+        self.results_folders_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.results_folders_box.insert("1.0", "Folder impact will appear here after a run.")
 
     def _build_fixes_tab(self):
         """Build fixes tab with a single inline IDE-style diff viewer."""
         tab = self.tabview.tab("🛠 Fixes")
+        self.fixes_tab = tab
         tab.grid_rowconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=0)
         tab.grid_rowconfigure(2, weight=1)
@@ -1419,6 +2133,7 @@ class ModernBibGUI:
 
         controls = ctk.CTkFrame(tab, fg_color="transparent")
         controls.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        self.fixes_controls = controls
         controls.grid_columnconfigure(1, weight=1)
 
         self.fix_file_menu = ctk.CTkOptionMenu(controls, values=["No changed files yet"], command=self._show_file_fix)
@@ -1445,6 +2160,7 @@ class ModernBibGUI:
 
         nav = ctk.CTkFrame(tab, fg_color="transparent")
         nav.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self.fixes_nav = nav
 
         self.prev_change_btn = ctk.CTkButton(
             nav,
@@ -1480,6 +2196,7 @@ class ModernBibGUI:
             wrap="none"
         )
         self.fixes_diff_text.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.fixes_diff_box = self.fixes_diff_text
 
     def _get_text_widget(self, ctk_textbox):
         """Return underlying tkinter Text widget from CTkTextbox."""
@@ -1602,12 +2319,29 @@ class ModernBibGUI:
             self._syncing_scroll_x = False
 
     def _scroll_to_changed_line(self, line_no: int):
-        """Scroll unified fixes diff pane to a target line number."""
+        """Scroll unified fixes diff pane and center a target line number."""
         tk_diff = self._get_text_widget(self.fixes_diff_text)
         idx = f"{line_no}.0"
         try:
             if tk_diff:
                 tk_diff.see(idx)
+                # Keep the current navigation target visually obvious.
+                try:
+                    tk_diff.tag_delete('hl_current_change')
+                except Exception:
+                    pass
+                tk_diff.tag_configure('hl_current_change', background='#fef08a', foreground='#111111')
+                tk_diff.tag_add('hl_current_change', f"{line_no}.0", f"{line_no}.end")
+
+                # Center the selected line in the viewport for unambiguous navigation.
+                tk_diff.update_idletasks()
+                last_line = int(float(tk_diff.index('end-1c').split('.')[0]))
+                first_fraction, last_fraction = tk_diff.yview()
+                visible_lines = max(int((last_fraction - first_fraction) * max(last_line, 1)), 1)
+                desired_first_line = max(1, int(line_no - (visible_lines / 2)))
+                max_first_line = max(1, last_line - visible_lines + 1)
+                desired_first_line = min(desired_first_line, max_first_line)
+                tk_diff.yview_moveto((desired_first_line - 1) / max(last_line, 1))
         except Exception:
             pass
 
@@ -1664,6 +2398,7 @@ class ModernBibGUI:
     def _build_duplicates_tab(self):
         """Build duplicates tab with a lightweight, readable group viewer and summary/raw toggle."""
         tab = self.tabview.tab("🔍 Duplicates")
+        self.duplicates_tab = tab
         tab.grid_rowconfigure(5, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
@@ -1677,6 +2412,7 @@ class ModernBibGUI:
 
         controls = ctk.CTkFrame(tab, fg_color="transparent")
         controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self.duplicates_controls = controls
         controls.grid_columnconfigure(1, weight=1)
 
         self.dup_prev_btn = ctk.CTkButton(
@@ -1685,7 +2421,7 @@ class ModernBibGUI:
             width=70,
             command=self._show_prev_duplicate_group,
             fg_color="gray25",
-            hover_color="gray30",
+            hover=False,
         )
         self.dup_prev_btn.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="w")
 
@@ -1705,7 +2441,7 @@ class ModernBibGUI:
             width=70,
             command=self._show_next_duplicate_group,
             fg_color="gray25",
-            hover_color="gray30",
+            hover=False,
         )
         self.dup_next_btn.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="e")
 
@@ -1720,6 +2456,7 @@ class ModernBibGUI:
 
         file_controls = ctk.CTkFrame(tab, fg_color="transparent")
         file_controls.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self.duplicates_file_controls = file_controls
         file_controls.grid_columnconfigure(1, weight=1)
 
         self.dup_file_prev_btn = ctk.CTkButton(
@@ -1728,7 +2465,7 @@ class ModernBibGUI:
             width=70,
             command=self._show_prev_duplicate_file,
             fg_color="gray25",
-            hover_color="gray30",
+            hover=False,
         )
         self.dup_file_prev_btn.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="w")
 
@@ -1748,7 +2485,7 @@ class ModernBibGUI:
             width=70,
             command=self._show_next_duplicate_file,
             fg_color="gray25",
-            hover_color="gray30",
+            hover=False,
         )
         self.dup_file_next_btn.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="e")
 
@@ -1763,6 +2500,7 @@ class ModernBibGUI:
 
         self.dup_decision_panel = ctk.CTkFrame(tab, fg_color="transparent")
         self.dup_decision_panel.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self.duplicates_decision_panel = self.dup_decision_panel
         self.dup_decision_panel.grid_columnconfigure((0, 1), weight=1)
 
         self.dup_keep_box = ctk.CTkTextbox(
@@ -1787,15 +2525,18 @@ class ModernBibGUI:
             wrap="none",
         )
         self.duplicates_text.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.duplicates_text_box = self.duplicates_text
         self.duplicates_text.insert("1.0", "Run pipeline, then open this tab to view duplicates.\n")
 
     def _build_about_tab(self):
         """Build about/help tab"""
         tab = self.tabview.tab("ℹ️ About")
+        self.about_tab = tab
         
         # Scrollable frame
         scroll = ctk.CTkScrollableFrame(tab)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        self.about_scroll = scroll
         
         about_text = """
         BibTeX Bibliography Manager
@@ -1856,6 +2597,7 @@ class ModernBibGUI:
             justify="left"
         )
         about_label.pack(padx=20, pady=20)
+        self.about_label = about_label
         
     def _update_threshold_label(self, value):
         """Update threshold label when slider moves"""
@@ -1881,6 +2623,7 @@ class ModernBibGUI:
             self.dir_entry.delete(0, "end")
             self.dir_entry.insert(0, str(candidate))
             self._log_message(f"ℹ️ Using demo folder: {candidate}")
+            self._load_library_preview_from_source(str(candidate))
         else:
             self._log_message("⚠️ test_data folder not found in current project")
 
@@ -1888,6 +2631,13 @@ class ModernBibGUI:
         """Clear logs/results quickly for a fresh demo run."""
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
+        self.results_text.insert("1.0", "Run the pipeline to see a summary of what changed.")
+        if hasattr(self, 'results_files_box'):
+            self.results_files_box.delete("1.0", "end")
+            self.results_files_box.insert("1.0", "Changed files will appear here after a run.")
+        if hasattr(self, 'results_folders_box'):
+            self.results_folders_box.delete("1.0", "end")
+            self.results_folders_box.insert("1.0", "Folder impact will appear here after a run.")
         if hasattr(self, 'fixes_diff_text'):
             self.fixes_diff_text.delete("1.0", "end")
         self.changed_info.configure(text="")
@@ -1902,7 +2652,7 @@ class ModernBibGUI:
         self._selected_library_entry = None
         if hasattr(self, 'library_info_text'):
             self.library_info_text.delete("1.0", "end")
-            self.library_info_text.insert("1.0", "Run pipeline, then select a reference to view metadata.")
+            self.library_info_text.insert("1.0", "Choose a folder, then select a reference to view metadata.")
         if hasattr(self, 'meta_author_var'):
             self.meta_author_var.set("")
         if hasattr(self, 'meta_year_var'):
@@ -1922,26 +2672,106 @@ class ModernBibGUI:
         self._set_status("Ready", "#3b8ed0")
         
     def _browse_directory(self):
-        """Open browser for ZIP file or directory."""
-        # First let user pick a ZIP file quickly.
-        zip_path = filedialog.askopenfilename(
-            title="Select Overleaf ZIP (or cancel to pick a folder)",
-            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
-        )
-        if zip_path:
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, zip_path)
-            return
-
-        # Fallback to folder selection.
-        directory = filedialog.askdirectory(title="Select Directory with .bib files")
+        """Select a project folder and preview all discovered references immediately."""
+        directory = filedialog.askdirectory(title="Select folder with .bib files")
         if directory:
             self.dir_entry.delete(0, "end")
             self.dir_entry.insert(0, directory)
+            self._load_library_preview_from_source(directory)
+
+    def _browse_project_source_file(self):
+        """Select a source file or archive and preview its bibliography content."""
+        file_path = filedialog.askopenfilename(
+            title="Select project source file",
+            filetypes=[
+                ("Supported sources", "*.zip *.tar *.tar.gz *.tgz *.bib *.tex"),
+                ("Zip archives", "*.zip"),
+                ("Tar archives", "*.tar *.tar.gz *.tgz"),
+                ("BibTeX files", "*.bib"),
+                ("LaTeX files", "*.tex"),
+                ("All files", "*.*"),
+            ],
+        )
+        if file_path:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, file_path)
+            self._load_library_preview_from_source(file_path)
+
+    def _load_library_preview_from_source(self, source_path: str):
+        """Load raw references from a folder, archive, or bibliography file."""
+        selected = Path(source_path)
+        if not selected.exists():
+            return
+
+        temp_dir_obj = None
+        working_directory = selected
+
+        try:
+            if selected.is_file():
+                suffixes = [suffix.lower() for suffix in selected.suffixes]
+                if selected.suffix.lower() == ".zip":
+                    temp_dir_obj = tempfile.TemporaryDirectory()
+                    with zipfile.ZipFile(str(selected), 'r') as zf:
+                        zf.extractall(temp_dir_obj.name)
+                    working_directory = Path(temp_dir_obj.name)
+                elif selected.name.lower().endswith(('.tar.gz', '.tgz', '.tar')):
+                    temp_dir_obj = tempfile.TemporaryDirectory()
+                    mode = 'r:gz' if selected.name.lower().endswith(('.tar.gz', '.tgz')) else 'r'
+                    with tarfile.open(str(selected), mode) as tf:
+                        tf.extractall(temp_dir_obj.name)
+                    working_directory = Path(temp_dir_obj.name)
+                elif selected.suffix.lower() in {'.bib', '.tex'}:
+                    working_directory = selected.parent
+                else:
+                    self._set_status("Unsupported source format", "#ef4444")
+                    self._log_message(f"⚠️ Unsupported source file: {selected.name}")
+                    return
+            elif not selected.is_dir():
+                return
+
+            self.manager = BibliographyManager(str(working_directory))
+            num_files, num_entries = self.manager.crawl_and_collect()
+            self._load_library_entries()
+
+            if num_entries > 0:
+                self._set_status(f"Loaded {num_entries} refs from {num_files} files", "#22c55e")
+                self._log_message(f"✓ Loaded {num_entries} references from {num_files} .bib file(s)")
+            else:
+                self._set_status("No references found", "#f59e0b")
+                self._log_message("⚠️ No .bib entries found in selected source")
+        except Exception as e:
+            self._set_status("Preview load failed", "#ef4444")
+            self._log_message(f"❌ Could not load references from source: {e}")
+        finally:
+            if temp_dir_obj is not None:
+                try:
+                    temp_dir_obj.cleanup()
+                except Exception:
+                    pass
             
     def _change_appearance(self, mode: str):
-        """Change appearance mode"""
-        ctk.set_appearance_mode(mode.lower())
+        """Change appearance mode without showing intermediate paint states."""
+        requested_mode = (mode or "light").lower()
+        if requested_mode == "system":
+            requested_mode = "light"
+
+        if requested_mode == self._theme_mode and self._last_applied_theme == requested_mode:
+            return
+
+        self._theme_mode = requested_mode
+
+        if self._theme_apply_job is not None:
+            try:
+                self.root.after_cancel(self._theme_apply_job)
+            except Exception:
+                pass
+
+        # Defer repaint so the option menu can fully close first.
+        self._theme_apply_job = self.root.after(120, self._apply_pending_theme)
+
+    def _apply_pending_theme(self):
+        self._theme_apply_job = None
+        self._apply_theme_palette(self._theme_mode)
         
     def _log_message(self, message: str, color: str = "white"):
         """Queue log messages and flush in small batches to reduce UI redraws."""
@@ -2018,6 +2848,36 @@ class ModernBibGUI:
             return True
         except Exception:
             return False
+
+    def _prepare_project_source(self, source_path: str):
+        """Resolve a project source into a working directory and optional temp workspace."""
+        selected = Path(source_path)
+        temp_dir_obj = None
+
+        if selected.is_dir():
+            return selected, temp_dir_obj
+
+        if not selected.is_file():
+            raise FileNotFoundError(f"Source does not exist: {source_path}")
+
+        source_name = selected.name.lower()
+        if selected.suffix.lower() == ".zip":
+            temp_dir_obj = tempfile.TemporaryDirectory()
+            with zipfile.ZipFile(str(selected), 'r') as zf:
+                zf.extractall(temp_dir_obj.name)
+            return Path(temp_dir_obj.name), temp_dir_obj
+
+        if source_name.endswith(('.tar.gz', '.tgz', '.tar')):
+            temp_dir_obj = tempfile.TemporaryDirectory()
+            mode = 'r:gz' if source_name.endswith(('.tar.gz', '.tgz')) else 'r'
+            with tarfile.open(str(selected), mode) as tf:
+                tf.extractall(temp_dir_obj.name)
+            return Path(temp_dir_obj.name), temp_dir_obj
+
+        if selected.suffix.lower() in {'.bib', '.tex'}:
+            return selected.parent, temp_dir_obj
+
+        raise ValueError(f"Unsupported project source format: {selected.suffix or source_name}")
         
     def _run_pipeline(self):
         """Run the bibliography management pipeline"""
@@ -2085,23 +2945,26 @@ class ModernBibGUI:
             input_path = Path(directory)
             working_directory = directory
 
-            # ZIP mode: extract first, process extracted folder, then re-zip.
-            if input_path.is_file() and input_path.suffix.lower() == ".zip":
-                zip_mode = True
-                zip_input_path = input_path
-                self._log_message("📦 ZIP mode: Extracting archive...")
-                temp_dir_obj = tempfile.TemporaryDirectory()
-                with zipfile.ZipFile(str(input_path), 'r') as zf:
-                    zf.extractall(temp_dir_obj.name)
-                working_directory = temp_dir_obj.name
-                self._log_message("✓ Archive extracted to temp workspace")
+            if input_path.is_file():
+                source_name = input_path.name.lower()
+                if input_path.suffix.lower() == ".zip" or source_name.endswith(('.tar.gz', '.tgz', '.tar')):
+                    zip_mode = True
+                    zip_input_path = input_path
+                    self._log_message("📦 Source archive: extracting to temp workspace...")
+                working_directory, temp_dir_obj = self._prepare_project_source(directory)
+                if zip_mode:
+                    self._log_message("✓ Archive extracted to temp workspace")
+            elif input_path.is_dir():
+                working_directory, temp_dir_obj = self._prepare_project_source(directory)
             
             self._log_message("="*60)
             self._log_message("🚀 Starting Bibliography Processing Pipeline")
             self._log_message("="*60)
             
             # Initialize manager
-            self.manager = BibliographyManager(working_directory)
+            self.manager = BibliographyManager(str(working_directory))
+            self.manager.report_data['push_back'] = push_back
+            self.manager.report_data['generate_report'] = generate_report
             
             # Step 1: Crawl
             if not self.processing:
@@ -2199,7 +3062,12 @@ class ModernBibGUI:
 
             # If input was ZIP, package processed files into a new ZIP and copy report outside temp dir.
             if zip_mode and zip_input_path is not None:
-                cleaned_zip = zip_input_path.with_name(f"{zip_input_path.stem}_cleaned.zip")
+                archive_stem = zip_input_path.name
+                for suffix in ('.tar.gz', '.tgz', '.tar', '.zip'):
+                    if archive_stem.lower().endswith(suffix):
+                        archive_stem = archive_stem[: -len(suffix)]
+                        break
+                cleaned_zip = zip_input_path.with_name(f"{archive_stem}_cleaned.zip")
                 with zipfile.ZipFile(str(cleaned_zip), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
                     for root, _, files in os.walk(working_directory):
                         for name in files:
@@ -2311,23 +3179,46 @@ class ModernBibGUI:
         self._set_status("Cancelling...", "#f59e0b")
         
     def _update_results(self):
-        """Update results tab with statistics and progress bars"""
+        """Update the dashboard with a concrete summary of what changed."""
         if not self.manager:
             return
         
         data = self.manager.report_data
+        file_changes = data.get('file_changes', {}) or {}
+        source_files = data.get('source_files', {}) or {}
+
+        scanned_folder_count = len({str(Path(info.get('relative_path', path)).parent) for path, info in source_files.items()}) if source_files else 0
+        changed_file_items = list(file_changes.items())
+        changed_file_count = len(changed_file_items)
+        bib_changed_count = sum(1 for path in file_changes if str(path).lower().endswith('.bib'))
+        tex_changed_count = sum(1 for path in file_changes if str(path).lower().endswith('.tex'))
+        changed_folder_counts = Counter(str(Path(path).parent) for path in file_changes)
+
+        def _change_rank(item):
+            path, payload = item
+            changed_lines = len(payload.get('changed_lines', []))
+            original_text = payload.get('original', '') or ''
+            updated_text = payload.get('updated', '') or ''
+            size_delta = abs(len(updated_text) - len(original_text))
+            return (changed_lines, size_delta, str(path).lower())
+
+        sorted_file_changes = sorted(changed_file_items, key=_change_rank, reverse=True)
         
         # Update stat cards
         self.stat_labels['files'].configure(text=str(data['files_found']))
+        self.stat_labels['folders'].configure(text=str(scanned_folder_count))
         self.stat_labels['initial'].configure(text=str(data['initial_entries']))
         self.stat_labels['groups'].configure(text=str(len(data['duplicate_groups'])))
         self.stat_labels['removed'].configure(text=str(data['duplicates_removed']))
         self.stat_labels['final'].configure(text=str(data['final_entries']))
+        self.stat_labels['keys'].configure(text=str(len(data['keys_changed'])))
         
         # Calculate time
         if data['start_time'] and data['end_time']:
             duration = (data['end_time'] - data['start_time']).total_seconds()
             self.stat_labels['time'].configure(text=f"{duration:.1f}s")
+        else:
+            self.stat_labels['time'].configure(text="—")
         
         # Update progress bars with visual feedback
         reduction_rate = (data['duplicates_removed'] / max(data['initial_entries'], 1)) * 100
@@ -2339,33 +3230,80 @@ class ModernBibGUI:
         max_keys = max(500, keys_count + 1)
         self.keys_bar.set(min(keys_count / max_keys, 1.0))
         self.keys_text.configure(text=f"{keys_count} keys normalized")
-        
-        # Detailed summary
-        lines = []
-        lines.append("Processing Summary")
-        lines.append("=" * 50)
-        lines.append("")
-        lines.append(f"Files Processed: {data['files_found']}")
-        lines.append(f"Initial Entries: {data['initial_entries']}")
-        lines.append(f"Duplicate Groups: {len(data['duplicate_groups'])}")
-        lines.append(f"Entries Removed: {data['duplicates_removed']}")
-        lines.append(f"Final Entries: {data['final_entries']}")
-        lines.append("")
-        lines.append(f"Reduction Rate: {reduction_rate:.1f}%")
-        lines.append(f"Keys Normalized: {len(data['keys_changed'])}")
-        if data.get('tex_citation_updates', 0):
-            lines.append(f"LaTeX Citations Updated: {data['tex_citation_updates']}")
-            lines.append(f".tex Files Updated: {data.get('tex_files_updated', 0)}")
-        lines.append("")
-        lines.append("=" * 50)
-        lines.append("✓ All original files backed up with timestamps")
-        lines.append("✓ Master bibliography created")
-        lines.append("✓ No data loss - backups available for restore")
 
-        summary = "\n".join(lines)
+        if hasattr(self, 'results_scope_label'):
+            if data.get('push_back'):
+                scope_text = "Changes pushed back to source folders"
+            else:
+                scope_text = "Review-only run; nothing was written back"
+            self.results_scope_label.configure(text=scope_text)
         
+        summary_lines = []
+        summary_lines.append("What changed")
+        summary_lines.append("=" * 50)
+        summary_lines.append("")
+        summary_lines.append(f"Scanned {data['files_found']} .bib file(s) across {scanned_folder_count} folder(s).")
+        summary_lines.append(
+            f"Removed {data['duplicates_removed']} duplicate entries from {data['initial_entries']} initial entries, leaving {data['final_entries']} unique references."
+        )
+        summary_lines.append(
+            f"Normalized {len(data['keys_changed'])} citation key(s) and updated {data.get('tex_citation_updates', 0)} citation reference(s) in {data.get('tex_files_updated', 0)} .tex file(s)."
+            if data.get('tex_citation_updates', 0)
+            else f"Normalized {len(data['keys_changed'])} citation key(s)."
+        )
+        summary_lines.append(
+            f"Changed {changed_file_count} file(s) across {len(changed_folder_counts)} folder(s): {bib_changed_count} .bib file(s) and {tex_changed_count} .tex file(s)."
+        )
+        summary_lines.append("")
+        if data.get('push_back'):
+            summary_lines.append("Changes were pushed back into the source folders.")
+            summary_lines.append("Backups are available in timestamped backup folders beside the original .bib files.")
+        else:
+            summary_lines.append("This was a review-only run. Nothing was written back to the source folders.")
+            summary_lines.append("Use the Pipeline tab to rerun with push-back enabled if you want the files updated in place.")
+        summary_lines.append("")
+        summary_lines.append("Next step: inspect the most changed files below, then open Fixes for line-level diffs if something looks off.")
+
+        file_lines = []
+        if sorted_file_changes:
+            for path, payload in sorted_file_changes[:8]:
+                changed_lines = len(payload.get('changed_lines', []))
+                original_text = payload.get('original', '') or ''
+                updated_text = payload.get('updated', '') or ''
+                size_delta = len(updated_text) - len(original_text)
+                delta_prefix = "+" if size_delta >= 0 else ""
+                file_lines.append(f"{path}")
+                file_lines.append(f"  {changed_lines} changed line(s), {delta_prefix}{size_delta} chars")
+                file_lines.append("")
+        else:
+            file_lines.append("No file-level changes were recorded.")
+
+        folder_lines = []
+        if changed_folder_counts:
+            folder_lines.append("Changed folders")
+            folder_lines.append("=" * 40)
+            for folder, count in sorted(changed_folder_counts.items(), key=lambda item: (-item[1], item[0])):
+                folder_lines.append(f"{folder or '.'}: {count} changed file(s)")
+        else:
+            folder_lines.append("No folders were modified.")
+
         self.results_text.delete("1.0", "end")
-        self.results_text.insert("1.0", summary)
+        self.results_text.insert("1.0", "\n".join(summary_lines))
+
+        self.results_files_box.delete("1.0", "end")
+        self.results_files_box.insert("1.0", "\n".join(file_lines).strip())
+
+        self.results_folders_box.delete("1.0", "end")
+        self.results_folders_box.insert("1.0", "\n".join(folder_lines).strip())
+
+    def _format_dashboard_change_counts(self, data: dict) -> tuple[int, int, int]:
+        """Return files, folders, and change counts for the dashboard."""
+        file_changes = data.get('file_changes', {}) or {}
+        source_files = data.get('source_files', {}) or {}
+        scanned_folder_count = len({str(Path(info.get('relative_path', path)).parent) for path, info in source_files.items()}) if source_files else 0
+        changed_folder_count = len({str(Path(path).parent) for path in file_changes}) if file_changes else 0
+        changed_file_count = len(file_changes)
+        return scanned_folder_count, changed_folder_count, changed_file_count
         
     def _mark_step_complete(self, step_name: str):
         """Mark a pipeline step as complete with timing"""
@@ -2855,12 +3793,15 @@ class ModernBibGUI:
         if changed and display_change_lines:
             display = changed[:20]
             suffix = ' ...' if len(changed) > 20 else ''
-            self.changed_info.configure(text=f"Changed lines ({len(changed)}): {display}{suffix}")
             self._current_changed_lines = sorted(changed)
             self._current_changed_display_lines = sorted(set(display_change_lines))
             self._current_changed_idx = 0
             self.prev_change_btn.configure(state="normal")
             self.next_change_btn.configure(state="normal")
+            source_ln = self._current_changed_lines[0] if self._current_changed_lines else "?"
+            self.changed_info.configure(
+                text=f"Change 1/{len(self._current_changed_display_lines)} (source line {source_ln})"
+            )
             self._scroll_to_changed_line(self._current_changed_display_lines[0])
         else:
             self.changed_info.configure(text="No inline changes recorded.")
