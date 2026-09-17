@@ -21,3 +21,8 @@ installer/output/
 
 # Virtual environment
 venv/
+
+# Local Streamlit workspace and public exports
+app/workspaces/
+app/static/
+static/*.bib

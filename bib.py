@@ -68,6 +68,7 @@ class BibliographyManager:
             'duplicate_groups': [],
             'duplicates_removed': 0,
             'keys_changed': [],
+            'metadata_fixes': [],
             'tex_files_updated': 0,
             'tex_citation_updates': 0,
             'final_entries': 0
@@ -473,11 +474,17 @@ class BibliographyManager:
             
             # Store in report data
             similarity_score = self.compute_similarity(self.all_entries[group[0]], self.all_entries[group[1]]) if len(group) > 1 else 100
+            first_entry = self.all_entries[group[0]]
+            second_entry = self.all_entries[group[1]]
+            first_doi = str(first_entry.get('doi', '')).strip().lower()
+            second_doi = str(second_entry.get('doi', '')).strip().lower()
+            reason = 'DOI match' if first_doi and first_doi == second_doi else 'Near-exact metadata match'
             self.report_data['duplicate_groups'].append({
                 'entries': group_entries,
                 'similarity': round(similarity_score, 1),
                 'entry_indices': group,  # Store original indices for reference
-                'kept_position': kept_position
+                'kept_position': kept_position,
+                'reason': reason,
             })
         
         return len(self.duplicate_groups)
@@ -526,6 +533,8 @@ class BibliographyManager:
         print(f"{'='*60}\n")
         
         if not self.duplicate_groups:
+            self.report_data['duplicates_removed'] = 0
+            self.report_data['final_entries'] = len(self.all_entries)
             print("✓ No duplicates to remove.\n")
             return
         
@@ -628,8 +637,27 @@ class BibliographyManager:
         
         existing_keys = set()
         key_changes = []
+        metadata_fixes = []
         
         for entry_index, entry in enumerate(self.all_entries, start=1):
+            for field in ('author', 'title', 'year'):
+                if not str(entry.get(field, '')).strip():
+                    metadata_fixes.append({
+                        'Entry': entry.get('ID', 'NO_ID'),
+                        'Field': field,
+                        'Change': 'Missing value detected',
+                    })
+
+            for field in ('title', 'journal', 'booktitle'):
+                value = entry.get(field)
+                if isinstance(value, str) and value != value.strip():
+                    entry[field] = value.strip()
+                    metadata_fixes.append({
+                        'Entry': entry.get('ID', 'NO_ID'),
+                        'Field': field,
+                        'Change': 'Trimmed surrounding whitespace',
+                    })
+
             old_key = entry.get('ID', 'NO_ID')
             new_key = self.generate_citation_key(entry, existing_keys, citekey_format, entry_index)
             existing_keys.add(new_key)
@@ -639,6 +667,7 @@ class BibliographyManager:
         
         # Store in report
         self.report_data['keys_changed'] = key_changes
+        self.report_data['metadata_fixes'] = metadata_fixes
         
         print(f"✓ Regenerated {len(key_changes)} citation keys")
         

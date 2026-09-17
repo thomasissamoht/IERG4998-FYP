@@ -1,338 +1,202 @@
 #!/usr/bin/env python3
-"""Browser interface for the BibTeX Bibliography Manager."""
+"""Multi-project Streamlit bibliography workspace."""
 
 from datetime import datetime
+from io import BytesIO
+import os
 from pathlib import Path
-import tempfile
+import shutil
+import zipfile
 
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 from bibtexparser.bwriter import BibTexWriter
-
 from bib import BibliographyManager
 
+st.set_page_config(page_title="Bib Workspace", page_icon="B", layout="wide")
 
-st.set_page_config(
-    page_title="BibTeX Bibliography Manager",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    .main-header { font-size: 2.7rem; font-weight: 700; padding: 0.4rem 0; }
-    .muted { color: #667085; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-RULE_FORMATS = {
-    "author-year-title": "{author}-{year}-{title}",
-    "author-year-titleword": "{author}-{year}-{titleword}",
-    "author-title": "{author}-{title}",
-    "professor-style": "{authorstem}{year}",
-    "professor-strict": "{authorstrict}{year}",
-    "author-et-al-year": "{authoretal}{year}",
-    "lastname-only-year": "{lastname}{year}",
-    "firstauthor-year-titleword": "{author}{year}{titleword}",
-    "compact-initials": "{authorinitials}{year}",
-    "numeric": "ref{numeric}",
-}
+APP_DIR = Path(__file__).resolve().parent / "app"
+# Streamlit serves files from the project-level ./static directory at /app/static/.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+WORKSPACE_DIR = APP_DIR / "workspaces"
+PUBLIC_BASE_URL = os.getenv("BIB_PUBLIC_BASE_URL", "").rstrip("/")
+USERNAME = os.getenv("BIB_APP_USERNAME", "admin")
+PASSWORD = os.getenv("BIB_APP_PASSWORD", "bibliography")
 
 
-def init_state():
-    defaults = {
-        "manager": None,
-        "processed": False,
-        "master_bytes": None,
-        "report_bytes": None,
-        "report_name": "bibliography_report.html",
-        "source_name": "",
-        "notes": {},
-        "tags": {},
-        "favorites": set(),
-        "issue_text": "",
-    }
+def initialize_state():
+    defaults = {"authenticated": False, "username": "", "active_project": "", "projects": {}}
     for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+        st.session_state.setdefault(key, value)
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def citation_format(rule: str, custom: str) -> str:
-    if rule == "custom" and custom.strip():
-        return custom.strip()
-    return RULE_FORMATS.get(rule, RULE_FORMATS["author-year-titleword"])
+def project_root(project_name: str) -> Path:
+    safe_name = "".join(character for character in project_name if character.isalnum() or character in "-_ ").strip().replace(" ", "_")
+    if not safe_name:
+        raise ValueError("Project names must contain letters or numbers.")
+    return WORKSPACE_DIR / st.session_state.username / safe_name
 
 
-def build_outputs(manager: BibliographyManager):
+def save_uploads(project_name: str, uploaded_files) -> Path:
+    target = project_root(project_name)
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    for uploaded_file in uploaded_files:
+        filename = Path(uploaded_file.name).name
+        if filename.lower().endswith(".zip"):
+            with zipfile.ZipFile(BytesIO(uploaded_file.getvalue())) as archive:
+                target_path = target.resolve()
+                for member in archive.infolist():
+                    destination = (target / member.filename).resolve()
+                    if not str(destination).startswith(str(target_path)):
+                        raise ValueError("The ZIP contains an unsafe path.")
+                archive.extractall(target)
+        elif filename.lower().endswith(".bib"):
+            (target / filename).write_bytes(uploaded_file.getvalue())
+    return target
+
+
+def write_master(manager: BibliographyManager, project_name: str) -> tuple[bytes, Path]:
     writer = BibTexWriter()
     writer.indent = "  "
     writer.order_entries_by = ("ID",)
     master_bytes = writer.write(manager.master_db).encode("utf-8")
-
-    report_bytes = None
-    report_name = "bibliography_report.html"
-    report_path = manager.generate_html_report()
-    if report_path and Path(report_path).exists():
-        report_bytes = Path(report_path).read_bytes()
-        report_name = Path(report_path).name
-    return master_bytes, report_bytes, report_name
+    export_path = STATIC_DIR / f"{project_name}.bib"
+    export_path.write_bytes(master_bytes)
+    return master_bytes, export_path
 
 
-def process_directory(directory: str, threshold: int, push_back: bool, generate_report: bool, key_format: str):
-    manager = BibliographyManager(directory)
+def process_workspace(project_name: str, workspace: Path):
+    manager = BibliographyManager(str(workspace))
     manager.report_data["start_time"] = datetime.now()
-    _num_files, num_entries = manager.crawl_and_collect()
-    if num_entries == 0:
-        raise ValueError("No BibTeX entries were found.")
-    manager.find_duplicates(threshold=float(threshold))
+    _file_count, entry_count = manager.crawl_and_collect()
+    if entry_count == 0:
+        raise ValueError("No BibTeX entries were found in the upload.")
+    manager.find_duplicates(threshold=85.0)
     manager.remove_duplicates()
-    manager.fix_citation_keys(key_format)
-    master_path = manager.create_master_bibliography()
-    if push_back:
-        manager.push_to_folders(master_path)
+    manager.fix_citation_keys("{author}-{year}-{titleword}")
+    manager.create_master_bibliography()
     manager.report_data["end_time"] = datetime.now()
-    writer = BibTexWriter()
-    writer.indent = "  "
-    writer.order_entries_by = ("ID",)
-    master_bytes = writer.write(manager.master_db).encode("utf-8")
-    if not generate_report:
-        return manager, master_bytes, None, None
-    _generated_master_bytes, report_bytes, report_name = build_outputs(manager)
-    return manager, master_bytes, report_bytes, report_name
+    master_bytes, export_path = write_master(manager, project_name)
+    st.session_state.projects[project_name] = {"manager": manager, "master_bytes": master_bytes, "export_path": str(export_path), "updated": datetime.now().isoformat(timespec="seconds")}
+    st.session_state.active_project = project_name
 
 
-def process_uploads(uploaded_files, threshold: int, key_format: str, generate_report: bool):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for uploaded_file in uploaded_files:
-            file_path = Path(temp_dir) / Path(uploaded_file.name).name
-            file_path.write_bytes(uploaded_file.getbuffer())
-        return process_directory(temp_dir, threshold, False, generate_report, key_format)
+def process_project(project_name: str, uploaded_files):
+    workspace = save_uploads(project_name, uploaded_files)
+    process_workspace(project_name, workspace)
 
 
-def entry_frame(manager: BibliographyManager) -> pd.DataFrame:
-    rows = []
-    duplicate_keys = {
-        str(entry.get("ID", "")).strip()
-        for group in manager.report_data.get("duplicate_groups", [])
-        for entry in group.get("entries", [])
-    }
-    for entry in manager.all_entries:
-        key = str(entry.get("ID", "")).strip()
-        rows.append(
-            {
-                "Favorite": "★" if key in st.session_state.favorites else "",
-                "Duplicate": "Yes" if key in duplicate_keys else "",
-                "Key": key,
-                "Authors": str(entry.get("author", "")),
-                "Year": str(entry.get("year", "")),
-                "Title": str(entry.get("title", "")),
-                "Source": str(entry.get("journal") or entry.get("booktitle") or entry.get("_source_file_display") or ""),
-                "DOI": str(entry.get("doi", "")),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def render_library(manager: BibliographyManager):
-    st.subheader("📚 Library")
-    frame = entry_frame(manager)
-    query = st.text_input("Search title, author, year, DOI, or key", key="library_query")
-    filters = st.multiselect("Filters", ["Duplicates", "Has DOI", "Missing year", "Favorites"])
-    if query:
-        mask = frame.astype(str).apply(lambda column: column.str.contains(query, case=False, na=False)).any(axis=1)
-        frame = frame[mask]
-    if "Duplicates" in filters:
-        frame = frame[frame["Duplicate"] == "Yes"]
-    if "Has DOI" in filters:
-        frame = frame[frame["DOI"].str.strip() != ""]
-    if "Missing year" in filters:
-        frame = frame[frame["Year"].str.strip() == ""]
-    if "Favorites" in filters:
-        frame = frame[frame["Favorite"] == "★"]
-
-    st.caption(f"Showing {len(frame)} of {len(manager.all_entries)} references")
-    st.dataframe(frame, use_container_width=True, height=390, hide_index=True)
-
-    keys = frame["Key"].tolist() if not frame.empty else []
-    selected_key = st.selectbox("Reference details", ["Select a reference"] + keys)
-    if selected_key != "Select a reference":
-        selected = next((entry for entry in manager.all_entries if str(entry.get("ID", "")) == selected_key), None)
-        if selected:
-            left, right = st.columns(2)
-            with left:
-                st.markdown(f"**{selected.get('title', 'Untitled')}**")
-                st.write(f"Authors: {selected.get('author', '')}")
-                st.write(f"Year: {selected.get('year', '')}")
-                st.write(f"Key: `{selected.get('ID', '')}`")
-                st.write(f"DOI: {selected.get('doi', '') or 'Not provided'}")
-            with right:
-                st.session_state.notes[selected_key] = st.text_area(
-                    "Notes", value=st.session_state.notes.get(selected_key, ""), key=f"note_{selected_key}"
-                )
-                st.session_state.tags[selected_key] = st.text_input(
-                    "Tags", value=st.session_state.tags.get(selected_key, ""), key=f"tag_{selected_key}"
-                )
-                if st.button("Toggle favorite", key=f"favorite_{selected_key}"):
-                    if selected_key in st.session_state.favorites:
-                        st.session_state.favorites.remove(selected_key)
-                    else:
-                        st.session_state.favorites.add(selected_key)
-                    st.rerun()
-
-
-def render_duplicates(manager: BibliographyManager):
-    st.subheader("🔍 Duplicate Review")
-    groups = manager.report_data.get("duplicate_groups", [])
-    if not groups:
-        st.success("No duplicate groups found.")
+def load_project(project_name: str):
+    """Rebuild in-memory state for a project discovered on disk."""
+    project = st.session_state.projects.get(project_name)
+    if project:
         return
-    labels = [f"Group {index}: {group.get('similarity', 'N/A')}% similarity" for index, group in enumerate(groups, 1)]
-    selected_index = st.selectbox("Duplicate group", range(len(labels)), format_func=lambda index: labels[index])
-    group = groups[selected_index]
-    st.write(f"Entries in group: {len(group.get('entries', []))}")
-    rows = []
-    for entry in group.get("entries", []):
-        rows.append(
-            {
-                "Status": "KEPT" if entry.get("_status") == "kept" else "REMOVED",
-                "Key": entry.get("ID", ""),
-                "Authors": entry.get("author", ""),
-                "Year": entry.get("year", ""),
-                "Title": entry.get("title", ""),
-                "Source": entry.get("_source_file_display", entry.get("_source_file", "")),
-                "Fields": entry.get("_merge_field_count", ""),
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    with st.expander("Show entry details"):
-        for entry in group.get("entries", []):
-            st.markdown(f"**{entry.get('_status', 'unknown').upper()}**: `{entry.get('ID', '')}`")
-            st.code(entry.get("_entry_text", "No original entry text available."), language="bibtex")
+    workspace = project_root(project_name)
+    if not workspace.is_dir():
+        return
+    process_workspace(project_name, workspace)
 
 
-def render_fixes(manager: BibliographyManager):
-    st.subheader("🛠 Fixes and Changes")
-    changes = manager.report_data.get("keys_changed", [])
-    if changes:
-        st.dataframe(pd.DataFrame(changes, columns=["Old key", "New key"]), use_container_width=True, hide_index=True)
+def login_page():
+    st.markdown("# Bib Workspace")
+    st.caption("Secure bibliography workspaces for research teams")
+    with st.form("login"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    if submitted:
+        if username == USERNAME and password == PASSWORD:
+            st.session_state.authenticated = True
+            st.session_state.username = username
+            st.switch_page(DASHBOARD_PAGE)
+        else:
+            st.error("Invalid username or password.")
+
+
+def render_audit(manager: BibliographyManager):
+    report = manager.report_data
+    audit_tabs = st.tabs(["Key transformation", "Merged duplicates", "Metadata fixes"])
+    with audit_tabs[0]:
+        st.dataframe(pd.DataFrame(report.get("keys_changed", []), columns=["Original Raw Key", "Normalized Key"]), use_container_width=True, hide_index=True)
+    with audit_tabs[1]:
+        rows = []
+        for group_number, group in enumerate(report.get("duplicate_groups", []), 1):
+            kept = next((item.get("ID", "") for item in group.get("entries", []) if item.get("_status") == "kept"), "")
+            for item in group.get("entries", []):
+                if item.get("_status") == "removed":
+                    rows.append({"Group": group_number, "Removed key": item.get("ID", ""), "Kept key": kept, "Reason": group.get("reason", "Duplicate match")})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    with audit_tabs[2]:
+        st.dataframe(pd.DataFrame(report.get("metadata_fixes", [])), use_container_width=True, hide_index=True)
+
+
+def dashboard_page():
+    if not st.session_state.authenticated:
+        st.switch_page(LOGIN_PAGE)
+    user_dir = WORKSPACE_DIR / st.session_state.username
+    user_dir.mkdir(parents=True, exist_ok=True)
+    project_names = sorted(set(path.name for path in user_dir.iterdir() if path.is_dir()) | set(st.session_state.projects))
+    with st.sidebar:
+        st.markdown("## Projects")
+        selected = st.selectbox("Active project", project_names or ["No projects yet"])
+        if project_names and selected != "No projects yet":
+            st.session_state.active_project = selected
+        with st.expander("Create new project"):
+            new_name = st.text_input("Project name", placeholder="ML_Journal_2026")
+            uploads = st.file_uploader("BibTeX or ZIP files", type=["bib", "zip"], accept_multiple_files=True)
+            create = st.button("Process project", type="primary", use_container_width=True)
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.username = ""
+            st.switch_page(LOGIN_PAGE)
+    st.markdown("# Bibliography workspace")
+    st.caption(f"Signed in as {st.session_state.username}")
+    if create:
+        if not new_name.strip() or not uploads:
+            st.warning("Enter a project name and upload at least one .bib or .zip file.")
+        else:
+            try:
+                with st.spinner("Processing and publishing bibliography..."):
+                    process_project(new_name.strip(), uploads)
+                st.success(f"{new_name.strip()} is ready.")
+            except Exception as error:
+                st.error(f"Processing failed: {error}")
+    if st.session_state.active_project and st.session_state.active_project not in st.session_state.projects:
+        with st.spinner("Loading project..."):
+            load_project(st.session_state.active_project)
+    project = st.session_state.projects.get(st.session_state.active_project)
+    if not project:
+        st.info("Create a project to begin.")
+        return
+    manager = project["manager"]
+    report = manager.report_data
+    st.subheader(st.session_state.active_project)
+    metrics = st.columns(5)
+    metrics[0].metric("Source files", report.get("files_found", 0))
+    metrics[1].metric("References", report.get("initial_entries", 0))
+    metrics[2].metric("Duplicates removed", report.get("duplicates_removed", 0))
+    metrics[3].metric("Final references", report.get("final_entries", 0))
+    metrics[4].metric("Keys normalized", len(report.get("keys_changed", [])))
+    if PUBLIC_BASE_URL:
+        export_url = f"{PUBLIC_BASE_URL}/{st.session_state.active_project}.bib"
+        st.success(f"Live Overleaf URL: {export_url}")
     else:
-        st.info("No citation keys changed during this run.")
-    st.markdown("#### Output files")
-    st.write("The cleaned bibliography and HTML report can be downloaded from the sidebar.")
-
-
-init_state()
-st.markdown('<div class="main-header">📚 BibTeX Bibliography Manager</div>', unsafe_allow_html=True)
-st.caption("Final Year Project | Browser-based testing interface")
-
-with st.sidebar:
-    st.header("⚙️ Project setup")
-    input_method = st.radio("Input method", ["Upload .bib files", "Use server directory"])
-    uploaded_files = []
-    directory = ""
-    if input_method == "Upload .bib files":
-        uploaded_files = st.file_uploader("Select one or more BibTeX files", type=["bib"], accept_multiple_files=True)
-    else:
-        directory = st.text_input("Server directory path", placeholder="C:/path/to/bibliography")
-    threshold = st.slider("Duplicate similarity threshold", 0, 100, 85)
-    push_back = st.checkbox("Push master.bib to source folders", value=True, disabled=input_method != "Use server directory")
-    generate_report = st.checkbox("Generate HTML report", value=True)
-
-    st.subheader("Citation key policy")
-    rule = st.selectbox("Naming rule", list(RULE_FORMATS) + ["custom"], index=1)
-    custom = st.text_input("Custom pattern", "{author}-{year}-{titleword}", disabled=rule != "custom")
-    st.caption(f"Format: `{citation_format(rule, custom)}`")
-    run_button = st.button("🚀 Run pipeline", type="primary", use_container_width=True)
-
-    if st.session_state.master_bytes:
-        st.download_button("💾 Download master.bib", st.session_state.master_bytes, "master.bib", "application/x-bibtex", use_container_width=True)
-    if st.session_state.report_bytes:
-        st.download_button("📊 Download HTML report", st.session_state.report_bytes, st.session_state.report_name, "text/html", use_container_width=True)
-
-if run_button:
-    try:
-        key_format = citation_format(rule, custom)
-        with st.spinner("Processing bibliography..."):
-            if input_method == "Upload .bib files":
-                if not uploaded_files:
-                    st.warning("Please upload at least one .bib file.")
-                    st.stop()
-                manager, master_bytes, report_bytes, report_name = process_uploads(uploaded_files, threshold, key_format, generate_report)
-                source_name = ", ".join(file.name for file in uploaded_files)
-            else:
-                if not directory or not Path(directory).is_dir():
-                    st.error("Please enter a valid server directory.")
-                    st.stop()
-                manager, master_bytes, report_bytes, report_name = process_directory(directory, threshold, push_back, generate_report, key_format)
-                source_name = directory
-        st.session_state.manager = manager
-        st.session_state.master_bytes = master_bytes
-        st.session_state.report_bytes = report_bytes
-        st.session_state.report_name = report_name or "bibliography_report.html"
-        st.session_state.source_name = source_name
-        st.session_state.processed = True
-        st.session_state.favorites = set()
-        st.success("Pipeline completed successfully.")
-    except Exception as error:
-        st.error(f"Pipeline failed: {error}")
-
-if st.session_state.processed and st.session_state.manager:
-    manager = st.session_state.manager
-    data = manager.report_data
+        export_url = f"http://localhost:8501/app/static/{st.session_state.active_project}.bib"
+        st.warning("A public URL is not configured. Start a Cloudflare tunnel and set BIB_PUBLIC_BASE_URL before processing uploads.")
+    st.code(export_url, language="text")
+    st.download_button("Download .bib", project["master_bytes"], f"{st.session_state.active_project}.bib", "application/x-bibtex")
+    st.caption(f"Published: {project['updated']}")
     st.divider()
-    st.subheader("📊 Processing dashboard")
-    metrics = st.columns(6)
-    metrics[0].metric("Files", data.get("files_found", 0))
-    metrics[1].metric("Initial entries", data.get("initial_entries", 0))
-    metrics[2].metric("Duplicate groups", len(data.get("duplicate_groups", [])))
-    metrics[3].metric("Removed", data.get("duplicates_removed", 0))
-    metrics[4].metric("Final entries", data.get("final_entries", 0))
-    metrics[5].metric("Keys changed", len(data.get("keys_changed", [])))
+    st.subheader("Processing report")
+    render_audit(manager)
 
-    tabs = st.tabs(["📈 Dashboard", "📚 Library", "🔍 Duplicates", "🛠 Fixes", "📄 Summary", "🐞 Report issue"])
-    with tabs[0]:
-        kept = data.get("final_entries", 0)
-        removed = data.get("duplicates_removed", 0)
-        fig = go.Figure(data=[go.Pie(labels=["Kept", "Removed"], values=[kept, removed], hole=0.35)])
-        fig.update_layout(height=360)
-        st.plotly_chart(fig, use_container_width=True)
-        groups = data.get("duplicate_groups", [])
-        if groups:
-            sizes = [len(group.get("entries", [])) for group in groups]
-            st.plotly_chart(px.bar(x=list(range(1, len(sizes) + 1)), y=sizes, labels={"x": "Group", "y": "Entries"}), use_container_width=True)
-    with tabs[1]:
-        render_library(manager)
-    with tabs[2]:
-        render_duplicates(manager)
-    with tabs[3]:
-        render_fixes(manager)
-    with tabs[4]:
-        start = data.get("start_time")
-        end = data.get("end_time")
-        duration = f"{(end - start).total_seconds():.1f}s" if start and end else "N/A"
-        st.markdown(f"""
-        **Source:** {st.session_state.source_name}
 
-        **Duration:** {duration}
-
-        **Similarity threshold:** {threshold}%
-
-        **Outputs:** cleaned `master.bib`, normalized citation keys, duplicate analysis, and backups for directory processing.
-        """)
-    with tabs[5]:
-        st.subheader("Report an issue")
-        st.caption("Describe the problem and download the report to send with your feedback.")
-        issue = st.text_area("Issue description", value=st.session_state.issue_text, height=180)
-        st.session_state.issue_text = issue
-        if st.button("Prepare issue report"):
-            issue_report = f"BibTeX Bibliography Manager issue report\nGenerated: {datetime.now():%Y-%m-%d %H:%M}\nSource: {st.session_state.source_name}\n\n{issue}\n"
-            st.download_button("Download issue report", issue_report, "bibliography_issue_report.txt", "text/plain")
-
-st.divider()
-st.caption("📚 BibTeX Bibliography Manager | Streamlit | Final Year Project 2026")
+initialize_state()
+LOGIN_PAGE = st.Page(login_page, title="Login", icon="🔐", default=True)
+DASHBOARD_PAGE = st.Page(dashboard_page, title="Dashboard", icon="📚")
+navigation = st.navigation([LOGIN_PAGE, DASHBOARD_PAGE])
+navigation.run()
