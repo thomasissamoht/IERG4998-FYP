@@ -48,6 +48,13 @@ except ImportError:
     fuzz = None
 
 
+WEAK_TITLE_WORDS = {
+    'also', 'based', 'case', 'certain', 'different', 'example',
+    'general', 'given', 'introduction', 'notes', 'results',
+    'some', 'study', 'using', 'very', 'with',
+}
+
+
 class BibliographyManager:
     """Main class for managing bibliography files"""
     
@@ -68,6 +75,7 @@ class BibliographyManager:
             'duplicate_groups': [],
             'duplicates_removed': 0,
             'keys_changed': [],
+            'key_audit': [],
             'metadata_fixes': [],
             'tex_files_updated': 0,
             'tex_citation_updates': 0,
@@ -463,12 +471,26 @@ class BibliographyManager:
                 if idx_in_group != kept_position:
                     contributed_fields = self._merge_contributed_fields(kept_entry, entry)
 
+                similarity = self.compute_similarity(kept_entry, entry)
+                kept_doi = str(kept_entry.get('doi', '')).strip().lower()
+                entry_doi = str(entry.get('doi', '')).strip().lower()
+                kept_title = self.normalize_string(kept_entry.get('title', ''))
+                entry_title = self.normalize_string(entry.get('title', ''))
+                if kept_doi and kept_doi == entry_doi:
+                    match_reason = f"Exact DOI match ({kept_doi})"
+                elif kept_title and kept_title == entry_title:
+                    match_reason = "Exact normalized title match"
+                else:
+                    match_reason = "Title, author, and year similarity"
+
                 # Add status and line number to entry dict
                 group_entries.append({
                     **entry,
                     '_status': 'kept' if idx_in_group == kept_position else 'removed',
                     '_merge_field_count': self._merge_field_count(entry),
-                    '_merged_into_master_fields': contributed_fields
+                    '_merged_into_master_fields': contributed_fields,
+                    '_match_confidence': round(similarity, 1),
+                    '_match_reason': match_reason,
                 })
             print()
             
@@ -478,7 +500,14 @@ class BibliographyManager:
             second_entry = self.all_entries[group[1]]
             first_doi = str(first_entry.get('doi', '')).strip().lower()
             second_doi = str(second_entry.get('doi', '')).strip().lower()
-            reason = 'DOI match' if first_doi and first_doi == second_doi else 'Near-exact metadata match'
+            first_title = self.normalize_string(first_entry.get('title', ''))
+            second_title = self.normalize_string(second_entry.get('title', ''))
+            if first_doi and first_doi == second_doi:
+                reason = 'Exact DOI match'
+            elif first_title and first_title == second_title:
+                reason = 'Exact normalized title match'
+            else:
+                reason = 'Title, author, and year similarity'
             self.report_data['duplicate_groups'].append({
                 'entries': group_entries,
                 'similarity': round(similarity_score, 1),
@@ -592,9 +621,12 @@ class BibliographyManager:
         year_match = re.search(r'\d{4}', year_raw)
         year = year_match.group(0) if year_match else '0000'
 
-        # Extract up to first two meaningful title words
+        # Prefer distinctive title tokens over filler and publication labels.
         title = self.normalize_string(entry.get('title', ''))
-        title_words = [w for w in title.split() if len(w) > 3]
+        title_words = [
+            word for word in title.split()
+            if len(word) > 3 and word not in WEAK_TITLE_WORDS
+        ]
         titleword = title_words[0] if title_words else 'paper'
         titleword2 = title_words[1] if len(title_words) > 1 else ''
         title_part = "-".join(title_words[:2]) if title_words else 'paper'
@@ -625,7 +657,7 @@ class BibliographyManager:
         base_key = key
         counter = 1
         while key in existing_keys:
-            key = f"{base_key}{chr(96 + counter)}"  # append a, b, c, ...
+            key = f"{base_key}-{chr(96 + counter)}"  # append -a, -b, -c, ...
             counter += 1
         return key
     
@@ -637,6 +669,7 @@ class BibliographyManager:
         
         existing_keys = set()
         key_changes = []
+        key_audit = []
         metadata_fixes = []
         
         for entry_index, entry in enumerate(self.all_entries, start=1):
@@ -662,11 +695,27 @@ class BibliographyManager:
             new_key = self.generate_citation_key(entry, existing_keys, citekey_format, entry_index)
             existing_keys.add(new_key)
             entry['ID'] = new_key
+            title_words = [
+                word for word in self.normalize_string(entry.get('title', '')).split()
+                if len(word) > 3 and word not in WEAK_TITLE_WORDS
+            ]
+            warning = ''
+            if not title_words:
+                warning = 'No distinctive title words; used paper fallback'
+            elif len(title_words) == 1:
+                warning = 'Only one distinctive title word was available'
+            key_audit.append({
+                'Original Raw Key': old_key,
+                'Normalized Key': new_key,
+                'Source Title': entry.get('title', ''),
+                'Warning': warning,
+            })
             if old_key != new_key:
                 key_changes.append((old_key, new_key))
         
         # Store in report
         self.report_data['keys_changed'] = key_changes
+        self.report_data['key_audit'] = key_audit
         self.report_data['metadata_fixes'] = metadata_fixes
         
         print(f"✓ Regenerated {len(key_changes)} citation keys")

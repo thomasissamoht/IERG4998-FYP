@@ -25,4 +25,5 @@ venv/
 # Local Streamlit workspace and public exports
 app/workspaces/
 app/static/
+app/users.json
 static/*.bib
