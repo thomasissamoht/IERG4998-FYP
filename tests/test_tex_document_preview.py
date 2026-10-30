@@ -3,10 +3,40 @@ import unittest
 from pathlib import Path
 
 from bib import BibliographyManager
-from bib_gui_modern import _collect_tex_documents
+from bib_gui_modern import (
+    _collect_tex_documents,
+    _find_tex_citation_spans,
+    _next_tex_citation_index,
+)
 
 
 class TexDocumentPreviewTests(unittest.TestCase):
+    def test_finds_common_citation_commands_for_document_navigation(self):
+        content = (
+            r"Intro \cite{key1} and \citep[see][p. 2]{key2}."
+            "\n"
+            r"\textcite*{key3}; \nocite{key4}."
+        )
+
+        citations = [
+            content[start:end]
+            for start, end in _find_tex_citation_spans(content)
+        ]
+
+        self.assertEqual(
+            citations,
+            [
+                r"\cite{key1}",
+                r"\citep[see][p. 2]{key2}",
+                r"\textcite*{key3}",
+            ],
+        )
+
+    def test_citation_navigation_wraps_in_both_directions(self):
+        self.assertEqual(_next_tex_citation_index(2, 1, 3), 0)
+        self.assertEqual(_next_tex_citation_index(0, -1, 3), 2)
+        self.assertEqual(_next_tex_citation_index(-1, 1, 0), -1)
+
     def test_collects_nested_tex_files_by_relative_path(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

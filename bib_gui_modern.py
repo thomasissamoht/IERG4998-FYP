@@ -9,6 +9,7 @@ import ctypes
 import threading
 import webbrowser
 import difflib
+import re
 from collections import Counter
 from pathlib import Path
 import tarfile
@@ -44,6 +45,22 @@ def _collect_tex_documents(root: Path) -> dict[str, str]:
 
 
 
+def _find_tex_citation_spans(content: str) -> list[tuple[int, int]]:
+    """Return character spans for common LaTeX citation commands."""
+    citation_pattern = re.compile(
+        r"(?<!\\)\\(?!nocite\b)[A-Za-z]*cite[A-Za-z]*\*?(?:\s*\[[^\]]*\]){0,2}\s*\{[^}]*\}",
+        re.IGNORECASE,
+    )
+    return [(match.start(), match.end()) for match in citation_pattern.finditer(content)]
+
+
+def _next_tex_citation_index(current: int, direction: int, citation_count: int) -> int:
+    """Return a wrapped citation index, or -1 when there are no citations."""
+    if citation_count == 0:
+        return -1
+    return (current + direction) % citation_count
+
+
 class ModernBibGUI:
     """Modern GUI for Bibliography Manager using CustomTkinter"""
 
@@ -71,6 +88,8 @@ class ModernBibGUI:
         self._current_changed_display_lines = []
         self._current_changed_idx = -1
         self._tex_documents = {}
+        self._tex_citation_spans = []
+        self._current_tex_citation_idx = -1
         self._show_unchanged_var = ctk.BooleanVar(value=True)
         self._diff_context_lines = 2
         self._last_master_path = None
@@ -2243,6 +2262,32 @@ class ModernBibGUI:
         )
         self.document_info.grid(row=0, column=1, sticky="ew")
 
+        self.document_previous_button = ctk.CTkButton(
+            controls,
+            text="Previous",
+            width=78,
+            command=lambda: self._navigate_tex_citation(-1),
+            state="disabled",
+        )
+        self.document_previous_button.grid(row=0, column=2, padx=(8, 4))
+
+        self.document_next_button = ctk.CTkButton(
+            controls,
+            text="Next",
+            width=64,
+            command=lambda: self._navigate_tex_citation(1),
+            state="disabled",
+        )
+        self.document_next_button.grid(row=0, column=3, padx=(4, 8))
+
+        self.document_citation_count = ctk.CTkLabel(
+            controls,
+            text="0 of 0",
+            width=54,
+            anchor="e",
+        )
+        self.document_citation_count.grid(row=0, column=4, sticky="e")
+
         self.document_text = ctk.CTkTextbox(
             tab,
             font=ctk.CTkFont(family="Consolas", size=12),
@@ -2260,6 +2305,7 @@ class ModernBibGUI:
         self.document_text.configure(state="normal")
         self.document_text.delete("1.0", "end")
         self.document_text.insert("1.0", content)
+        self._highlight_tex_citations(content)
         self.document_text.configure(state="disabled")
         report_data = self.manager.report_data if self.manager else {}
         if report_data.get("push_back"):
@@ -2271,6 +2317,59 @@ class ModernBibGUI:
         else:
             self.document_info.configure(text=f"{selection} · source file (unchanged)")
 
+    def _highlight_tex_citations(self, content: str):
+        """Highlight all citation commands and select the first for navigation."""
+        text_widget = self._get_text_widget(self.document_text)
+        if text_widget is None:
+            return
+
+        text_widget.tag_configure("tex_citation", background="#fff0a6", foreground="#111827")
+        text_widget.tag_configure("tex_citation_current", background="#93c5fd", foreground="#111827")
+        text_widget.tag_raise("tex_citation_current")
+        self._tex_citation_spans = _find_tex_citation_spans(content)
+        self._current_tex_citation_idx = 0 if self._tex_citation_spans else -1
+
+        for start, end in self._tex_citation_spans:
+            text_widget.tag_add(
+                "tex_citation",
+                f"1.0 + {start} chars",
+                f"1.0 + {end} chars",
+            )
+
+        self._update_tex_citation_navigation()
+
+    def _navigate_tex_citation(self, direction: int):
+        """Move the active citation selection, wrapping at either end."""
+        if not self._tex_citation_spans:
+            return
+
+        self._current_tex_citation_idx = _next_tex_citation_index(
+            self._current_tex_citation_idx,
+            direction,
+            len(self._tex_citation_spans),
+        )
+        text_widget = self._get_text_widget(self.document_text)
+        if text_widget is None:
+            return
+
+        text_widget.tag_remove("tex_citation_current", "1.0", "end")
+        start, end = self._tex_citation_spans[self._current_tex_citation_idx]
+        start_index = f"1.0 + {start} chars"
+        end_index = f"1.0 + {end} chars"
+        text_widget.tag_add("tex_citation_current", start_index, end_index)
+        text_widget.see(start_index)
+        self._update_tex_citation_navigation()
+
+    def _update_tex_citation_navigation(self):
+        """Refresh navigation controls for the currently displayed document."""
+        citation_count = len(self._tex_citation_spans)
+        has_citations = citation_count > 0
+        button_state = "normal" if has_citations else "disabled"
+        self.document_previous_button.configure(state=button_state)
+        self.document_next_button.configure(state=button_state)
+        current = self._current_tex_citation_idx + 1 if has_citations else 0
+        self.document_citation_count.configure(text=f"{current} of {citation_count}")
+
     def _load_tex_documents(self):
         """Populate the document picker from the completed pipeline result."""
         report_data = self.manager.report_data if self.manager else {}
@@ -2279,6 +2378,11 @@ class ModernBibGUI:
 
         self.document_text.configure(state="normal")
         self.document_text.delete("1.0", "end")
+        self._tex_citation_spans = []
+        self._current_tex_citation_idx = -1
+        self.document_previous_button.configure(state="disabled")
+        self.document_next_button.configure(state="disabled")
+        self.document_citation_count.configure(text="0 of 0")
         self.document_text.configure(state="disabled")
 
         error = report_data.get("tex_preview_error")
@@ -2318,6 +2422,11 @@ class ModernBibGUI:
             return
         self.document_text.configure(state="normal")
         self.document_text.delete("1.0", "end")
+        self._tex_citation_spans = []
+        self._current_tex_citation_idx = -1
+        self.document_previous_button.configure(state="disabled")
+        self.document_next_button.configure(state="disabled")
+        self.document_citation_count.configure(text="0 of 0")
         self.document_text.configure(state="disabled")
         self.document_file_menu.configure(values=[message], state="disabled")
         self.document_file_menu.set(message)
