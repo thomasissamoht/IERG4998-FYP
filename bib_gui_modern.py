@@ -114,7 +114,7 @@ class ModernBibGUI:
         self.fixes_h_scrollbar = None
         
         # Citation key normalization rule (default and custom)
-        self.citekey_rule_var = ctk.StringVar(value="author-year-title")
+        self.citekey_rule_var = ctk.StringVar(value="compact-initials")
         self.citekey_custom_var = ctk.StringVar(value="{author}-{year}-{title}")
 
         # Build UI
@@ -659,7 +659,7 @@ class ModernBibGUI:
             command=self._on_citekey_rule_changed,
         )
         self.citekey_rule_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
-        self.citekey_rule_menu.set("author-year-title")
+        self.citekey_rule_menu.set("compact-initials")
 
         self.citekey_custom_entry = ctk.CTkEntry(
             keys_card,
@@ -671,7 +671,7 @@ class ModernBibGUI:
 
         ctk.CTkLabel(
             keys_card,
-            text="Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {lastname}, {authorinitials}, {year}, {titleword}, {numeric}",
+            text="Default: every author's surname initial + year (SD2024); repeats use a, b, c... in source order. Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {lastname}, {authorinitials}, {year}, {titleword}, {numeric}",
             wraplength=274,
             justify="left",
             text_color="#7f8ba1",

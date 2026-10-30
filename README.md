@@ -158,10 +158,9 @@ Expected results:
    - Eliminates redundant entries
 
 4. **Normalize Keys** 🔑
-   - Generates consistent citation keys
-   - Format: `firstname-year-keyword`
-   - Ensures uniqueness with suffixes
-   - Maintains valid BibTeX format
+   - Default: concatenate the first letter of every author's surname with the four-digit year (`Smith and Doe`, 2024 → `SD2024`)
+   - Papers with the same author initials and year receive lowercase `a`, `b`, `c`... suffixes in source order (`SD2024`, `SD2024a`, `SD2024b`)
+   - Uses `X` when no author is available and `0000` when no four-digit year is available
 
 ### Safety Features
 

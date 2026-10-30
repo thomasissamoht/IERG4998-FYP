@@ -600,7 +600,7 @@ class BibliographyManager:
         self,
         entry: Dict,
         existing_keys: Set[str],
-        citekey_format: str = "{author}-{year}-{title}",
+        citekey_format: str = "{authorinitials}{year}",
         entry_index: int = 1,
     ) -> str:
         """Generate a citation key for an entry using a user-defined format string.
@@ -630,7 +630,7 @@ class BibliographyManager:
         titleword = title_words[0] if title_words else 'paper'
         titleword2 = title_words[1] if len(title_words) > 1 else ''
         title_part = "-".join(title_words[:2]) if title_words else 'paper'
-        authorinitials = ''.join(name[:1] for name in clean_authors[:3]) or 'unk'
+        authorinitials = ''.join(name[0].upper() for name in clean_authors if name) or 'X'
         numeric = str(entry_index)
 
         # Compose key using format string
@@ -650,18 +650,24 @@ class BibliographyManager:
             title_part=title_part
         )
 
-        # Clean up double dashes, spaces, etc.
-        key = re.sub(r'[^a-z0-9\-]', '', key.lower().replace(' ', '-'))
+        # Keep the default compact policy uppercase, but retain legacy casing for other formats.
+        compact_initials = citekey_format == "{authorinitials}{year}"
+        normalized_key = key.replace(' ', '-')
+        if compact_initials:
+            key = re.sub(r'[^A-Za-z0-9\-]', '', normalized_key)
+        else:
+            key = re.sub(r'[^a-z0-9\-]', '', normalized_key.lower())
 
         # Ensure uniqueness
         base_key = key
         counter = 1
         while key in existing_keys:
-            key = f"{base_key}-{chr(96 + counter)}"  # append -a, -b, -c, ...
+            suffix = chr(96 + counter)
+            key = f"{base_key}{suffix}" if compact_initials else f"{base_key}-{suffix}"
             counter += 1
         return key
     
-    def fix_citation_keys(self, citekey_format: str = "{author}-{year}-{title}"):
+    def fix_citation_keys(self, citekey_format: str = "{authorinitials}{year}"):
         """Regenerate citation keys with user-defined naming scheme"""
         print(f"\n{'='*60}")
         print(f"STEP 3: Fixing citation keys (labels)...")
