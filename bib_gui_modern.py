@@ -3171,14 +3171,6 @@ class ModernBibGUI:
             self._log_message(f"✓ Master file generated")
             self._last_master_path = str(master_path)
 
-            try:
-                self.manager.report_data["tex_documents"] = _collect_tex_documents(Path(working_directory))
-            except (OSError, UnicodeError) as error:
-                self.manager.report_data["tex_preview_error"] = (
-                    f"Could not load LaTeX document preview: {error}"
-                )
-                self._log_message(f"⚠️ {self.manager.report_data['tex_preview_error']}")
-            
             # Push back if requested
             if push_back:
                 if not self.processing:
@@ -3188,6 +3180,14 @@ class ModernBibGUI:
                 self.manager.push_to_folders(master_path)
                 self._log_message("✓ Distribution complete")
             
+            try:
+                self.manager.report_data["tex_documents"] = _collect_tex_documents(Path(working_directory))
+            except (OSError, UnicodeError) as error:
+                self.manager.report_data["tex_preview_error"] = (
+                    f"Could not load LaTeX document preview: {error}"
+                )
+                self._log_message(f"⚠️ {self.manager.report_data['tex_preview_error']}")
+
             # Generate report
             self.manager.report_data['end_time'] = self.manager.report_data.get('end_time') or __import__('datetime').datetime.now()
             if generate_report:

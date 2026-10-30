@@ -846,11 +846,7 @@ class BibliographyManager:
 
         # Update LaTeX citations globally under root directory once.
         if mapping:
-            try:
-                self._update_latex_citations(mapping)
-            except Exception:
-                # Non-fatal: keep pipeline successful even if tex rewrite fails
-                pass
+            self._update_latex_citations(mapping)
         
         print(f"✓ Master bibliography distributed to {len(directories)} folder(s)\n")
 
@@ -1022,8 +1018,8 @@ class BibliographyManager:
 
                 tex_files_updated += 1
                 tex_citation_updates += replaced_count
-            except Exception:
-                continue
+            except OSError as error:
+                raise OSError(f"Could not update LaTeX citations in {tex_file}") from error
 
         self.report_data['file_changes'] = file_changes
         self.report_data['tex_files_updated'] = tex_files_updated
