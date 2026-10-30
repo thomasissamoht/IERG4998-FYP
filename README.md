@@ -11,7 +11,7 @@ A comprehensive, cross-platform tool for managing, deduplicating, and organizing
 - **📄 LaTeX Preview** - Inspect project `.tex` files and normalized citation keys after processing
 - **💾 Automatic Backups** - Timestamped backups created before any changes
 - **📊 Beautiful HTML Reports** - Professional reports with statistics and duplicate analysis
-- **🎨 Modern GUI** - CustomTkinter interface with dark/light mode
+- **🎨 Modern GUI** - CustomTkinter interface with system-aware light/dark themes, consistent colors, and adaptive window sizing
 - **🌐 Web App** - Streamlit interface for cloud deployment
 - **💻 CLI** - Full command-line control for automation
 

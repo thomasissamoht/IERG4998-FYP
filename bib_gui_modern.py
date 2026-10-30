@@ -31,8 +31,19 @@ if TYPE_CHECKING:
     webview: Any  # pragma: no cover
 
 # Set appearance mode and color theme
-ctk.set_appearance_mode("light")  # Modes: "System" (default), "Dark", "Light"
+ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")  # Themes: "blue" (default), "green", "dark-blue"
+
+
+def _resolve_appearance_mode(selection: str, system_mode: str) -> str:
+    """Resolve the appearance selector to the light or dark palette."""
+    normalized_selection = selection.lower()
+    normalized_system_mode = system_mode.lower()
+    if normalized_selection == "system":
+        normalized_selection = normalized_system_mode
+    if normalized_selection not in {"light", "dark"}:
+        raise ValueError(f"Unsupported appearance mode: {selection}")
+    return normalized_selection
 
 
 def _collect_tex_documents(root: Path) -> dict[str, str]:
@@ -75,8 +86,13 @@ class ModernBibGUI:
     def __init__(self):
         """Initialize the modern GUI"""
         self.root = ctk.CTk()
-        self.root.title("📚 BibTeX Bibliography Manager")
-        self.root.geometry("1400x900")
+        self.root.title("BibTeX Manager")
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1400, max(960, int(screen_width * 0.94)))
+        window_height = min(900, max(680, int(screen_height * 0.9)))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(min(window_width, 960), min(window_height, 680))
         
         # Manager instance
         self.manager: Optional[BibliographyManager] = None
@@ -98,7 +114,7 @@ class ModernBibGUI:
         self._sidebar_icon_buttons = {}
         self._sidebar_sections = {}
         self._redraw_suspend_count = 0
-        self._theme_mode = "light"
+        self._theme_mode = ctk.get_appearance_mode().lower()
         self._theme_apply_job = None
         self._last_applied_theme = None
         self._tooltip_window = None
@@ -154,20 +170,21 @@ class ModernBibGUI:
         mode = (mode or self._theme_mode or "dark").lower()
         if mode == "light":
             return {
-                "root": "#eef2f7",
-                "main": "#f7f9fc",
+                "root": "#e9eef6",
+                "main": "#f4f7fb",
                 "header": "#ffffff",
                 "panel": "#ffffff",
-                "panel2": "#eef3f9",
+                "panel2": "#f0f4f9",
                 "card": "#ffffff",
-                "surface": "#f4f7fb",
-                "rail": "#e7edf5",
+                "surface": "#f8fafc",
+                "rail": "#edf2f8",
                 "rail_active": "#d7e4f5",
-                "border": "#d3dce8",
+                "border": "#d5deea",
                 "text": "#162133",
                 "muted": "#5d6c82",
                 "muted2": "#8090a6",
                 "accent": "#0f6fff",
+                "accent_hover": "#0b5ed7",
                 "accent_text": "#ffffff",
                 "badge_bg": "#eaf2ff",
                 "badge_text": "#0f4eb8",
@@ -185,20 +202,21 @@ class ModernBibGUI:
                 "icon_active": "#d8e5f7",
             }
         return {
-            "root": "#101218",
-            "main": "#0f1218",
-            "header": "#161b24",
-            "panel": "#161b24",
-            "panel2": "#141922",
-            "card": "#161b24",
-            "surface": "#161b24",
+            "root": "#0b1020",
+            "main": "#0f172a",
+            "header": "#111827",
+            "panel": "#111827",
+            "panel2": "#0f172a",
+            "card": "#151e2f",
+            "surface": "#1b2638",
             "rail": "#0b1322",
             "rail_active": "#2b3a54",
-            "border": "#222938",
+            "border": "#273449",
             "text": "#e5edf9",
             "muted": "#8f99ab",
             "muted2": "#7f8ba1",
-            "accent": "#2878ff",
+            "accent": "#3b82f6",
+            "accent_hover": "#2563eb",
             "accent_text": "#ffffff",
             "badge_bg": "#1f2937",
             "badge_text": "#93c5fd",
@@ -339,26 +357,31 @@ class ModernBibGUI:
             if btn is None:
                 continue
             if button_name == "run_btn":
-                set_cfg(btn, fg_color=palette["accent"], hover=False, text_color=palette["accent_text"])
+                set_cfg(btn, fg_color=palette["accent"], hover=True, hover_color=palette["accent_hover"], text_color=palette["accent_text"])
             else:
-                set_cfg(btn, fg_color=palette["button"], hover=False, text_color=palette["button_text"])
+                set_cfg(btn, fg_color=palette["button"], hover=True, hover_color=palette["button_hover"], text_color=palette["button_text"])
 
         for menu_name in ("appearance_menu", "citekey_rule_menu", "library_density_menu", "collection_menu"):
             menu = getattr(self, menu_name, None)
             set_cfg(menu, fg_color=palette["button"], button_color=palette["button_hover"], text_color=palette["button_text"])
 
-        for label_name in ("library_left_title_label", "library_left_tip_label", "library_count_badge", "main_title_label", "main_subtitle_label", "library_left_header_label", "library_shortcut_hint", "library_details_title", "status_label"):
+        for label_name in ("library_left_title_label", "library_left_tip_label", "main_title_label", "main_subtitle_label", "library_left_header_label", "library_shortcut_hint", "library_details_title"):
             label = getattr(self, label_name, None)
             if label is None:
                 continue
-            if label_name in ("library_count_badge", "top_status_badge"):
-                continue
-            set_cfg(label, text_color=palette["text"] if mode == "light" else getattr(label, "cget", lambda *_: None)("text_color"))
+            set_cfg(label, text_color=palette["text"])
 
         set_cfg(getattr(self, "library_left_title_label", None), text_color=palette["text"])
         set_cfg(getattr(self, "library_left_tip_label", None), text_color=palette["muted"])
         set_cfg(getattr(self, "main_title_label", None), text_color=palette["text"])
         set_cfg(getattr(self, "main_subtitle_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "header_hint_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "sidebar_brand_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "threshold_title_label", None), text_color=palette["text"])
+        set_cfg(getattr(self, "threshold_label", None), text_color=palette["accent"])
+        set_cfg(getattr(self, "threshold_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "keys_description_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "appearance_title_label", None), text_color=palette["text"])
         set_cfg(getattr(self, "library_details_title", None), text_color=palette["text"])
         set_cfg(getattr(self, "library_shortcut_hint", None), text_color=palette["muted"])
         set_cfg(getattr(self, "library_count_badge", None), fg_color=palette["badge_bg"], text_color=palette["badge_text"])
@@ -534,6 +557,7 @@ class ModernBibGUI:
         
     def _build_sidebar(self):
         """Build a single-icon collapsible sidebar drawer for app controls."""
+        palette = self._theme_palette(self._theme_mode)
         sidebar = ctk.CTkFrame(self.root, width=320, corner_radius=0)
         sidebar.grid(row=0, column=0, sticky="nsew")
         self._sidebar_root = sidebar
@@ -559,12 +583,8 @@ class ModernBibGUI:
             text="Bibliography Workspace",
             font=ctk.CTkFont(size=18, weight="bold")
         ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            brand,
-            text="Click left icons to open tools",
-            font=ctk.CTkFont(size=11),
-            text_color="#8f99ab"
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.sidebar_brand_hint = ctk.CTkLabel(brand, text="Click left icons to open tools", font=ctk.CTkFont(size=11), text_color=palette["muted"])
+        self.sidebar_brand_hint.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         panel_host = ctk.CTkFrame(sidebar, fg_color="transparent")
         panel_host.grid(row=1, column=1, sticky="nsew")
@@ -645,10 +665,11 @@ class ModernBibGUI:
         row = ctk.CTkFrame(options_card, fg_color="transparent")
         row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 0))
         row.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(row, text="Duplicate Similarity", font=ctk.CTkFont(size=11), text_color="#d2d8e5").grid(row=0, column=0, sticky="w")
+        self.threshold_title_label = ctk.CTkLabel(row, text="Duplicate Similarity", font=ctk.CTkFont(size=11), text_color=palette["text"])
+        self.threshold_title_label.grid(row=0, column=0, sticky="w")
 
         self.threshold_var = ctk.IntVar(value=85)
-        self.threshold_label = ctk.CTkLabel(row, text="85%", text_color="#66b3ff", font=ctk.CTkFont(size=11, weight="bold"))
+        self.threshold_label = ctk.CTkLabel(row, text="85%", text_color=palette["accent"], font=ctk.CTkFont(size=11, weight="bold"))
         self.threshold_label.grid(row=0, column=1, sticky="e")
 
         self.threshold_slider = ctk.CTkSlider(
@@ -707,7 +728,7 @@ class ModernBibGUI:
             text="Default: every author's surname initial + year (SD2024); repeats use a, b, c... in source order. Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {lastname}, {authorinitials}, {year}, {titleword}, {numeric}",
             wraplength=274,
             justify="left",
-            text_color="#7f8ba1",
+            text_color=palette["muted"],
             font=ctk.CTkFont(size=10),
         ).grid(row=3, column=0, padx=12, pady=(0, 10), sticky="w")
 
@@ -729,18 +750,18 @@ class ModernBibGUI:
         self.appearance_card = appearance_card
         appearance_card.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(appearance_card, text="Appearance", font=ctk.CTkFont(size=13, weight="bold"), text_color="#d2d8e5").grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 6)
-        )
+        self.appearance_title_label = ctk.CTkLabel(appearance_card, text="Appearance", font=ctk.CTkFont(size=13, weight="bold"), text_color=palette["text"])
+        self.appearance_title_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
         self.appearance_menu = ctk.CTkOptionMenu(
             appearance_card,
             values=["System", "Light", "Dark"],
             command=self._change_appearance,
-            fg_color="gray25",
-            button_color="gray30"
+            fg_color=palette["button"],
+            button_color=palette["button_hover"],
+            text_color=palette["button_text"],
         )
         self.appearance_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
-        self.appearance_menu.set("Light")
+        self.appearance_menu.set("System")
 
         self._set_sidebar_mode("controls", force_open=True)
 
@@ -772,8 +793,9 @@ class ModernBibGUI:
         for mode, btn in self._sidebar_icon_buttons.items():
             active = mode == self._sidebar_mode
             btn.configure(
-                fg_color=palette["button"],
-                hover=False,
+                fg_color=palette["icon_active"] if active else "transparent",
+                hover=True,
+                hover_color=palette["button_hover"],
                 text_color=palette["accent"] if active else palette["muted2"],
             )
         
@@ -802,7 +824,7 @@ class ModernBibGUI:
             header,
             text="Track pipeline progress, inspect duplicates, and verify fixes before export",
             font=ctk.CTkFont(size=11),
-            text_color="#8f99ab"
+            text_color=self._theme_palette(self._theme_mode)["muted"]
         )
         self.main_subtitle_label.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
@@ -824,8 +846,9 @@ class ModernBibGUI:
             header_actions,
             text="Clean and Normalize",
             command=self._run_pipeline,
-            height=30,
-            width=116,
+            height=36,
+            width=156,
+            corner_radius=9,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
         self.run_btn.grid(row=0, column=0, padx=(0, 6))
@@ -834,8 +857,9 @@ class ModernBibGUI:
             header_actions,
             text="Cancel",
             command=self._cancel_pipeline,
-            height=30,
+            height=34,
             width=80,
+            corner_radius=9,
             state="disabled"
         )
         self.cancel_btn.grid(row=0, column=1, padx=(0, 6))
@@ -844,18 +868,20 @@ class ModernBibGUI:
             header_actions,
             text="Open Report",
             command=self._view_report,
-            height=30,
+            height=34,
             width=100,
+            corner_radius=9,
             state="disabled"
         )
         self.view_report_btn.grid(row=0, column=2)
 
-        ctk.CTkLabel(
+        self.header_hint_label = ctk.CTkLabel(
             header,
             text="Folder selection previews references. Use Clean and Normalize for full dedupe/key cleanup.",
             font=ctk.CTkFont(size=10),
-            text_color="#8f99ab",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 8))
+            text_color=self._theme_palette(self._theme_mode)["muted"],
+        )
+        self.header_hint_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 8))
 
         self.tabview = ctk.CTkTabview(main_frame, corner_radius=10)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -1400,8 +1426,9 @@ class ModernBibGUI:
         for mode, btn in self._library_left_icon_buttons.items():
             active = mode == self._library_left_mode
             btn.configure(
-                fg_color=palette["button"],
-                hover=False,
+                fg_color=palette["icon_active"] if active else "transparent",
+                hover=True,
+                hover_color=palette["button_hover"],
                 text_color=palette["accent"] if active else palette["muted2"],
             )
 
@@ -1420,8 +1447,9 @@ class ModernBibGUI:
             count = counts.get(scope, 0)
             btn.configure(
                 text=f"{scope} ({count})",
-                fg_color=palette["button"],
-                hover=False,
+                fg_color=palette["icon_active"] if active else palette["button"],
+                hover=True,
+                hover_color=palette["button_hover"],
                 text_color=palette["accent"] if active else palette["muted2"],
             )
 
@@ -2986,9 +3014,12 @@ class ModernBibGUI:
             
     def _change_appearance(self, mode: str):
         """Change appearance mode without showing intermediate paint states."""
-        requested_mode = (mode or "light").lower()
-        if requested_mode == "system":
-            requested_mode = "light"
+        requested_mode = (mode or "system").lower()
+        if requested_mode not in {"system", "light", "dark"}:
+            raise ValueError(f"Unsupported appearance mode: {mode}")
+
+        ctk.set_appearance_mode(requested_mode)
+        requested_mode = _resolve_appearance_mode(requested_mode, ctk.get_appearance_mode())
 
         if requested_mode == self._theme_mode and self._last_applied_theme == requested_mode:
             return
