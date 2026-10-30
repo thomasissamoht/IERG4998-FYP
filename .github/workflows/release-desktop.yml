@@ -1,0 +1,115 @@
+name: Release Desktop Apps
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify release tag matches VERSION
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          tag_version="${RELEASE_TAG#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$tag_version" != "$file_version" ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match VERSION '$file_version'. Update VERSION and push the matching v$file_version tag."
+            exit 1
+          fi
+
+  build-windows:
+    runs-on: windows-latest
+    needs: validate-version
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv venv
+          .\venv\Scripts\python.exe -m pip install --upgrade pip
+          .\venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller
+
+      - name: Build Windows app
+        run: .\build_windows.ps1
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          .\installer\compile_inno.ps1 -Version $version
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/output/BibTeXManagerSetup.exe
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    needs: validate-version
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Make build script executable
+        run: chmod +x installer/build_mac_setup.sh
+
+      - name: Build macOS package
+        run: APP_VERSION="${GITHUB_REF_NAME#v}" ./installer/build_mac_setup.sh
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: |
+            installer/output/*.dmg
+            installer/output/*.zip
+          if-no-files-found: error
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-macos]
+
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-installer'
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -16,6 +16,17 @@ A comprehensive, cross-platform tool for managing, deduplicating, and organizing
 
 ## 🚀 Quick Start
 
+### Download the desktop app (no Python setup required)
+
+Download the latest installer from the repository's [GitHub Releases](https://github.com/thomasissamoht/IERG4998-FYP/releases/latest):
+
+- **Windows:** Download `BibTeXManagerSetup.exe`, run it, and launch **BibTeX Manager** from the Start menu.
+- **macOS:** Download `BibTeXManager-mac-<version>.dmg`, open it, and drag **BibTeX Manager** to Applications.
+
+Choose the file for your operating system. The installers include the app and its runtime dependencies; you do not need to install Python or run `pip`. Because these builds are currently unsigned/not notarized, Windows SmartScreen or macOS Gatekeeper may show a first-launch warning. Only continue if the installer came from this repository's Releases page. On Mac, Control-click the app and choose **Open** to approve it.
+
+Maintainers: update `VERSION` to the release number, then push the matching tag (for example, set `VERSION` to `1.0.10` and push `v1.0.10`). GitHub Actions builds both installers and attaches them to that GitHub Release.
+
 ### On Windows:
 ```bash
 # Create virtual environment

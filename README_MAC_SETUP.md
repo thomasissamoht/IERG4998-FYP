@@ -1,5 +1,17 @@
 # 📚 BibTeX Bibliography Manager - Quick Start Guide
 
+## Download and install (end users)
+
+You do not need Python, Xcode, or project dependencies to use a published desktop release:
+
+1. Download `BibTeXManager-mac-<version>.dmg` from the repository's [latest GitHub Release](https://github.com/thomasissamoht/IERG4998-FYP/releases/latest).
+2. Open the DMG and drag **BibTeX Manager** to Applications.
+3. Open it from Applications.
+
+The app bundles its runtime dependencies. Since the release is not signed or notarized, macOS may block the first launch. If you trust the download from this repository, Control-click the app in Applications, choose **Open**, then confirm **Open**. This approval is needed only the first time.
+
+The remaining setup instructions below are for maintainers building the app manually or users running the Python source version.
+
 ## 🎯 For Mac Demonstration
 
 ### System Requirements
