@@ -183,12 +183,13 @@ class BibliographyManager:
         print(f"{'='*60}")
         print(f"Searching in: {self.root_directory}\n")
         
-        # Find all .bib files recursively (exclude master.bib and backups)
+        # Ignore backups and generated processed copies so source records retain their keys.
+        root_path = Path(self.root_directory).resolve()
         all_bib_files = list(Path(self.root_directory).rglob("*.bib"))
         self.bib_files = [
             bib_file for bib_file in all_bib_files
             if bib_file.name.lower() != "master.bib"
-            and not any(part.startswith("backup_") for part in bib_file.parts)
+            and not self._is_generated_workspace_path(bib_file, root_path)
         ]
         
         if not self.bib_files:
@@ -267,6 +268,19 @@ class BibliographyManager:
         
         return len(self.bib_files), len(self.all_entries)
     
+    @staticmethod
+    def _is_generated_workspace_path(path: Path, root_path: Path) -> bool:
+        """Exclude backups and processed output from a later source scan."""
+        try:
+            relative_parts = path.resolve().relative_to(root_path).parts
+        except ValueError:
+            return False
+        return any(
+            part.startswith("backup_")
+            or (index == 0 and (part == "processed" or part.startswith("processed_")))
+            for index, part in enumerate(relative_parts)
+        )
+
     def normalize_string(self, text: str) -> str:
         """Normalize a string for comparison
         
@@ -915,9 +929,8 @@ class BibliographyManager:
                     with open(bib_file, 'w', encoding='utf-8') as f:
                         f.write(updated_text)
 
-            except Exception:
-                # ignore file-specific errors
-                continue
+            except OSError as error:
+                raise OSError(f"Could not update bibliography keys in {bib_file}") from error
 
         # Update report_data
         self.report_data['file_changes'] = file_changes
@@ -992,9 +1005,10 @@ class BibliographyManager:
         file_changes: Dict[str, Dict] = self.report_data.get('file_changes', {})
         tex_files_updated = 0
         tex_citation_updates = 0
+        root_path = Path(self.root_directory).resolve()
 
         for tex_file in Path(self.root_directory).rglob('*.tex'):
-            if any(part.startswith('backup_') for part in tex_file.parts):
+            if self._is_generated_workspace_path(tex_file, root_path):
                 continue
 
             try:

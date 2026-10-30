@@ -71,6 +71,46 @@ class TexDocumentPreviewTests(unittest.TestCase):
             self.assertEqual(manager.report_data["tex_citation_updates"], 1)
             self.assertEqual(manager.report_data["tex_files_updated"], 1)
 
+    def test_existing_processed_subfolders_do_not_hide_source_key_changes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "references.bib").write_text(
+                "@article{oldKey,\n"
+                "  author = {Smith, Jane},\n"
+                "  title = {A Test Article},\n"
+                "  year = {2024}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "paper.tex").write_text(r"\cite{oldKey}" + "\n", encoding="utf-8")
+
+            old_processed = root / "processed"
+            old_processed.mkdir()
+            (old_processed / "references.bib").write_text(
+                "@article{S2024,\n"
+                "  author = {Smith, Jane},\n"
+                "  title = {A Test Article},\n"
+                "  year = {2024}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (old_processed / "paper.tex").write_text(r"\cite{S2024}" + "\n", encoding="utf-8")
+
+            manager = BibliographyManager(str(root))
+            self.assertEqual(manager.crawl_and_collect(), (1, 1))
+            manager.remove_duplicates()
+            manager.fix_citation_keys()
+            master_path = manager.create_master_bibliography()
+            processed = manager.push_to_folders(master_path)
+            result_root = processed or root
+
+            self.assertEqual(
+                _collect_tex_documents(result_root)["paper.tex"],
+                r"\cite{S2024}" + "\n",
+            )
+            self.assertEqual(manager.report_data["tex_citation_updates"], 1)
+            self.assertEqual(manager.report_data["tex_files_updated"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
