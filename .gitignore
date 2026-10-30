@@ -6,6 +6,8 @@ __pycache__/
 *_report_*.html
 *_cleaned.zip
 report_*.html
+**/backup_*/
+bibtex-manager/
 
 # Local build/packaging outputs
 bibtex-manager-portable.zip

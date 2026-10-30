@@ -34,6 +34,16 @@ ctk.set_appearance_mode("light")  # Modes: "System" (default), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (default), "green", "dark-blue"
 
 
+def _collect_tex_documents(root: Path) -> dict[str, str]:
+    """Read project LaTeX files by relative path for the document preview."""
+    return {
+        str(tex_file.relative_to(root)): tex_file.read_text(encoding="utf-8")
+        for tex_file in sorted(root.rglob("*.tex"))
+        if tex_file.is_file()
+    }
+
+
+
 class ModernBibGUI:
     """Modern GUI for Bibliography Manager using CustomTkinter"""
 
@@ -60,6 +70,7 @@ class ModernBibGUI:
         self._current_changed_lines = []
         self._current_changed_display_lines = []
         self._current_changed_idx = -1
+        self._tex_documents = {}
         self._show_unchanged_var = ctk.BooleanVar(value=True)
         self._diff_context_lines = 2
         self._last_master_path = None
@@ -274,6 +285,9 @@ class ModernBibGUI:
         set_cfg(getattr(self, "fixes_controls", None), fg_color="transparent")
         set_cfg(getattr(self, "fixes_nav", None), fg_color="transparent")
         set_cfg(getattr(self, "fixes_diff_box", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
+        set_cfg(getattr(self, "documents_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "documents_controls", None), fg_color="transparent")
+        set_cfg(getattr(self, "document_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
         set_cfg(getattr(self, "duplicates_tab", None), fg_color=palette["panel2"])
         set_cfg(getattr(self, "duplicates_controls", None), fg_color="transparent")
         set_cfg(getattr(self, "duplicates_file_controls", None), fg_color="transparent")
@@ -833,6 +847,7 @@ class ModernBibGUI:
         self.tabview.add("📈 Dashboard")
         self.tabview.add("🔍 Duplicates")
         self.tabview.add("🛠 Fixes")
+        self.tabview.add("📄 Documents")
         self.tabview.add("ℹ️ About")
         
         self._build_library_tab()
@@ -840,6 +855,7 @@ class ModernBibGUI:
         self._build_results_tab()
         self._build_duplicates_tab()
         self._build_fixes_tab()
+        self._build_documents_tab()
         self._build_about_tab()
 
         # Refresh heavy tabs only when user opens them.
@@ -2198,6 +2214,115 @@ class ModernBibGUI:
         self.fixes_diff_text.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.fixes_diff_box = self.fixes_diff_text
 
+    def _build_documents_tab(self):
+        """Build a read-only viewer for project .tex files after processing."""
+        tab = self.tabview.tab("📄 Documents")
+        self.documents_tab = tab
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        controls = ctk.CTkFrame(tab, fg_color="transparent")
+        controls.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        self.documents_controls = controls
+        controls.grid_columnconfigure(1, weight=1)
+
+        self.document_file_menu = ctk.CTkOptionMenu(
+            controls,
+            values=["Run the pipeline to load .tex files"],
+            command=self._show_tex_document,
+            state="disabled",
+        )
+        self.document_file_menu.grid(row=0, column=0, padx=(0, 10), sticky="w")
+        self.document_file_menu.set("Run the pipeline to load .tex files")
+
+        self.document_info = ctk.CTkLabel(
+            controls,
+            text="Choose a LaTeX file to inspect citation keys.",
+            text_color="gray",
+            anchor="w",
+        )
+        self.document_info.grid(row=0, column=1, sticky="ew")
+
+        self.document_text = ctk.CTkTextbox(
+            tab,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="none",
+            state="disabled",
+        )
+        self.document_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    def _show_tex_document(self, selection: str):
+        """Show the selected processed or source LaTeX document."""
+        content = self._tex_documents.get(selection)
+        if content is None:
+            return
+
+        self.document_text.configure(state="normal")
+        self.document_text.delete("1.0", "end")
+        self.document_text.insert("1.0", content)
+        self.document_text.configure(state="disabled")
+        report_data = self.manager.report_data if self.manager else {}
+        if report_data.get("push_back"):
+            citation_count = report_data.get("tex_citation_updates", 0)
+            file_count = report_data.get("tex_files_updated", 0)
+            self.document_info.configure(
+                text=f"{selection} · updated source project · {citation_count} citation(s) updated across {file_count} .tex file(s)"
+            )
+        else:
+            self.document_info.configure(text=f"{selection} · source file (unchanged)")
+
+    def _load_tex_documents(self):
+        """Populate the document picker from the completed pipeline result."""
+        report_data = self.manager.report_data if self.manager else {}
+        documents = report_data.get("tex_documents", {})
+        self._tex_documents = documents if isinstance(documents, dict) else {}
+
+        self.document_text.configure(state="normal")
+        self.document_text.delete("1.0", "end")
+        self.document_text.configure(state="disabled")
+
+        error = report_data.get("tex_preview_error")
+        if error:
+            self.document_file_menu.configure(values=["Preview unavailable"], state="disabled")
+            self.document_file_menu.set("Preview unavailable")
+            self.document_info.configure(text=error)
+            return
+
+        file_names = sorted(self._tex_documents)
+        if not file_names:
+            self.document_file_menu.configure(values=["No .tex files found"], state="disabled")
+            self.document_file_menu.set("No .tex files found")
+            self.document_info.configure(text="No LaTeX .tex files were found in this project.")
+            return
+
+        self.document_file_menu.configure(values=file_names, state="normal")
+        self.document_file_menu.set(file_names[0])
+
+        if report_data.get("push_back"):
+            citation_count = report_data.get("tex_citation_updates", 0)
+            file_count = report_data.get("tex_files_updated", 0)
+            self.document_info.configure(
+                text=f"Updated source preview · {citation_count} citation(s) updated in {file_count} .tex file(s); original source files unchanged."
+            )
+        else:
+            self.document_info.configure(
+                text="Showing source files. The update option was off, so citation keys in source files were not rewritten."
+            )
+
+        self._show_tex_document(file_names[0])
+
+    def _reset_tex_document_view(self, message: str):
+        """Clear any stale document preview before another pipeline run."""
+        self._tex_documents = {}
+        if not hasattr(self, "document_text"):
+            return
+        self.document_text.configure(state="normal")
+        self.document_text.delete("1.0", "end")
+        self.document_text.configure(state="disabled")
+        self.document_file_menu.configure(values=[message], state="disabled")
+        self.document_file_menu.set(message)
+        self.document_info.configure(text="Choose a LaTeX file to inspect citation keys.")
+
     def _get_text_widget(self, ctk_textbox):
         """Return underlying tkinter Text widget from CTkTextbox."""
         return (
@@ -2640,6 +2765,7 @@ class ModernBibGUI:
             self.results_folders_box.insert("1.0", "Folder impact will appear here after a run.")
         if hasattr(self, 'fixes_diff_text'):
             self.fixes_diff_text.delete("1.0", "end")
+        self._reset_tex_document_view("Run the pipeline to load .tex files")
         self.changed_info.configure(text="")
         self._current_changed_lines = []
         self._current_changed_display_lines = []
@@ -2891,6 +3017,8 @@ class ModernBibGUI:
             self._log_message("❌ Directory does not exist!", "red")
             return
         
+        self._reset_tex_document_view("Processing project...")
+
         # Clear previous results
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
@@ -3042,6 +3170,14 @@ class ModernBibGUI:
             master_path = self.manager.create_master_bibliography()
             self._log_message(f"✓ Master file generated")
             self._last_master_path = str(master_path)
+
+            try:
+                self.manager.report_data["tex_documents"] = _collect_tex_documents(Path(working_directory))
+            except (OSError, UnicodeError) as error:
+                self.manager.report_data["tex_preview_error"] = (
+                    f"Could not load LaTeX document preview: {error}"
+                )
+                self._log_message(f"⚠️ {self.manager.report_data['tex_preview_error']}")
             
             # Push back if requested
             if push_back:
@@ -3110,6 +3246,7 @@ class ModernBibGUI:
             
             # Update results
             self._ui_call(self._update_results)
+            self._ui_call(self._load_tex_documents)
             self._ui_call(self._load_library_entries)
             # Defer heavy duplicates rendering until user opens the Duplicates tab.
             self._pending_duplicates_refresh = True

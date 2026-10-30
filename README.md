@@ -8,6 +8,7 @@ A comprehensive, cross-platform tool for managing, deduplicating, and organizing
 - **🗑️ Smart Deduplication** - Merges duplicates intelligently, keeps most complete entry
 - **🔑 Citation Key Normalization** - Standardizes citation keys to `firstname-year-keyword` format
 - **📂 Batch Processing** - Crawls folders recursively, processes hundreds of files
+- **📄 LaTeX Preview** - Inspect project `.tex` files and normalized citation keys after processing
 - **💾 Automatic Backups** - Timestamped backups created before any changes
 - **📊 Beautiful HTML Reports** - Professional reports with statistics and duplicate analysis
 - **🎨 Modern GUI** - CustomTkinter interface with dark/light mode
