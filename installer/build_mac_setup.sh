@@ -5,7 +5,9 @@ APP_NAME="BibTeX Manager"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-if [[ -f VERSION ]]; then
+if [[ -n "${APP_VERSION:-}" ]]; then
+  VERSION="$APP_VERSION"
+elif [[ -f VERSION ]]; then
   VERSION="$(tr -d '[:space:]' < VERSION)"
 else
   VERSION="1.0.0"
@@ -42,26 +44,26 @@ python -m pip install -r requirements.txt pyinstaller
 echo "[3/4] Building .app..."
 rm -rf build dist "${APP_NAME}.spec"
 
-ICON_ARGS=()
+PYINSTALLER_ARGS=(
+  --noconfirm
+  --clean
+  --windowed
+  --name "$APP_NAME"
+  --collect-all customtkinter
+  --hidden-import bibtexparser.bparser
+  --hidden-import bibtexparser.bwriter
+  --hidden-import bibtexparser.bibdatabase
+  --add-data "test_data:test_data"
+)
+
 if [[ -f "$ICON_PATH" ]]; then
   echo "Using icon: $ICON_PATH"
-  ICON_ARGS=(--icon "$ICON_PATH")
+  PYINSTALLER_ARGS+=(--icon "$ICON_PATH")
 else
   echo "No mac icon found at $ICON_PATH (continuing without custom icon)."
 fi
 
-python -m PyInstaller \
-  --noconfirm \
-  --clean \
-  --windowed \
-  --name "$APP_NAME" \
-  --collect-all customtkinter \
-  --hidden-import bibtexparser.bparser \
-  --hidden-import bibtexparser.bwriter \
-  --hidden-import bibtexparser.bibdatabase \
-  --add-data "test_data:test_data" \
-  "${ICON_ARGS[@]}" \
-  bib_gui_modern.py
+python -m PyInstaller "${PYINSTALLER_ARGS[@]}" bib_gui_modern.py
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
   echo "Expected app bundle not found: $APP_BUNDLE"
