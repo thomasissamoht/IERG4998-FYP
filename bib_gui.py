@@ -111,7 +111,7 @@ class BibliographyManagerGUI:
         self.threshold_var.trace_add('write', self.update_threshold_label)
         
         self.push_back_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(control_frame, text="Push back to folders", 
+        ttk.Checkbutton(control_frame, text="Create processed copy (preserve originals)",
                        variable=self.push_back_var).grid(row=0, column=5, padx=5)
         
         # Progress display
@@ -222,17 +222,14 @@ DUPLICATE DETECTION CRITERIA:
 4. Year Match (bonus +10%)
 
 CITATION KEY GENERATION:
-Format: firstname-year-firstword
-- firstname: First author's last name
-- year: Publication year
-- firstword: First 3+ letter word from title
+Format: first letter of each author's surname + publication year
+- Example: Smith and Doe (2024) becomes SD2024
+- Repeated author/year keys receive a, b, c... suffixes in source order
+- Missing publication year uses 0000
 
-If duplicate keys exist, appends: -a, -b, -c, etc.
-
-BACKUP STRATEGY:
-- Original .bib files are backed up before being replaced
-- Backups stored in: folder/backup_YYYYMMDD_HHMMSS/
-- Backups are timestamped to prevent accidental overwriting
+OUTPUT:
+- Creates a processed project copy beside the source folder
+- Updates .bib and .tex files in the copy, leaving originals unchanged
 
 RECOMMENDATIONS:
 - Start with 85% threshold
@@ -337,12 +334,12 @@ RECOMMENDATIONS:
             self.log_message("STEP 4: Creating master bibliography...", "step")
             self.log_message("="*60 + "\n", "step")
             
-            master_path = self.manager.create_master_bibliography()
-            
-            # Step 6: Push back
             if push_back:
-                self.log_message("\nPushing master.bib to original folders...", "step")
-                self.manager.push_to_folders(master_path, create_backup=True)
+                self.log_message("\nCreating processed project copy...", "step")
+                processed_directory = self.manager.create_processed_copy()
+                master_path = str(processed_directory / "master.bib")
+            else:
+                master_path = self.manager.create_master_bibliography()
             
             # Final summary
             self.log_message("\n" + "="*60, "header")

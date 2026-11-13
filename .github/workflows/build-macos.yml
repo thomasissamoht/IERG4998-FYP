@@ -7,7 +7,15 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -27,7 +35,7 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-installer
+          name: macos-${{ matrix.arch }}-installer
           path: |
             installer/output/*.dmg
             installer/output/*.zip

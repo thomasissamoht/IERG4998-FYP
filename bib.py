@@ -8,7 +8,7 @@ This tool helps manage BibTeX bibliography files by:
 1. Crawling folders to find and merge .bib files
 2. Identifying and removing duplicates (perfect and partial matches)
 3. Fixing citation keys (labels) with consistent naming
-4. Pushing the cleaned master bibliography back to original folders
+4. Creating a processed copy beside the source project without changing originals
 """
 
 import os
@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import Any, List, Dict, Tuple, Set
 import re
 import hashlib
+import unicodedata
+from collections import Counter
 
 # Set UTF-8 encoding for Windows console  
 if sys.platform == 'win32':
@@ -32,7 +34,7 @@ if sys.platform == 'win32':
 
 try:
     import bibtexparser
-    from bibtexparser.bparser import BibTexParser
+    from bibtexparser.bparser import BibTexParser, STANDARD_TYPES
     from bibtexparser.bwriter import BibTexWriter
     from bibtexparser.bibdatabase import BibDatabase
 except ImportError:
@@ -54,6 +56,270 @@ WEAK_TITLE_WORDS = {
     'some', 'study', 'using', 'very', 'with',
 }
 
+MAX_FUZZY_BUCKET_SIZE = 500
+BIBTEX_PARSE_BATCH_SIZE = 2500
+LARGE_BIB_PARSE_THRESHOLD = 5 * 1024 * 1024
+
+
+def _embedded_bib_blocks(text: str):
+    """Find line-delimited filecontents BibTeX blocks and their content spans."""
+    begin_pattern = re.compile(
+        r'(?m)^[ \t]*\\begin\{(filecontents\*?)\}'
+        r'(?:[ \t]*\[[^\]\r\n]*\])?[ \t]*\{([^{}\r\n]+)\}[ \t]*(?:%[^\r\n]*)?\r?$'
+    )
+    position = 0
+    while match := begin_pattern.search(text, position):
+        end_pattern = re.compile(
+            r'(?m)^[ \t]*\\end\{' + re.escape(match.group(1))
+            + r'\}[ \t]*(?:%[^\r\n]*)?\r?$'
+        )
+        end = end_pattern.search(text, match.end())
+        if end is None:
+            raise ValueError(f"Unclosed {match.group(1)} block for {match.group(2)}")
+        filename = match.group(2).strip()
+        if filename.lower().endswith('.bib'):
+            yield filename, match.end(), end.start()
+        position = end.end()
+
+
+def _manual_bibliography_entries(text: str):
+    """Extract simple bibitems while retaining offsets into the original text."""
+    masked = list(text)
+    note_chars = list(text)
+
+    def hide(start: int, end: int, comment: bool = False) -> None:
+        for index in range(start, end):
+            if text[index] not in '\r\n':
+                masked[index] = ' '
+                if comment:
+                    note_chars[index] = ' '
+
+    position = 0
+    while position < len(text):
+        if text[position] == '%':
+            end = text.find('\n', position)
+            end = len(text) if end < 0 else end
+            hide(position, end, comment=True)
+            position = end
+        elif text[position] == '\\':
+            begin = re.match(r'\\begin\{(verbatim\*?|lstlisting|minted|filecontents\*?)\}', text[position:])
+            if begin:
+                marker = r'\end{' + begin.group(1) + '}'
+                end = text.find(marker, position + begin.end())
+                if end < 0:
+                    raise ValueError(f"Unclosed {begin.group(1)} environment")
+                end += len(marker)
+                hide(position, end)
+                position = end
+            else:
+                verb = re.match(r'\\verb\*?([^A-Za-z\s])', text[position:])
+                if verb:
+                    end = text.find(verb.group(1), position + verb.end())
+                    if end < 0 or '\n' in text[position:end]:
+                        raise ValueError("Unclosed verb command")
+                    hide(position, end + 1)
+                    position = end + 1
+                else:
+                    position += 2
+        else:
+            position += 1
+    code = ''.join(masked)
+    environments = re.compile(r'(?<!\\)\\(begin|end)\s*\{thebibliography\}')
+    active = None
+
+    def argument(position: int, opening: str, closing: str) -> Tuple[str, int]:
+        while position < len(code) and code[position].isspace():
+            position += 1
+        if position >= len(code) or code[position] != opening:
+            raise ValueError(f"Malformed thebibliography: expected {opening}")
+        start = position + 1
+        depth = 1
+        brace_depth = 0
+        position += 1
+        while position < len(code):
+            ch = code[position]
+            if ch == '\\':
+                position += 2
+                continue
+            if opening == '[':
+                if ch == '{':
+                    brace_depth += 1
+                elif ch == '}' and brace_depth:
+                    brace_depth -= 1
+            if not brace_depth:
+                if ch == opening:
+                    depth += 1
+                elif ch == closing:
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:position], position + 1
+            position += 1
+        raise ValueError(f"Unclosed {opening} argument in thebibliography")
+
+    for environment in environments.finditer(code):
+        if environment.group(1) == 'begin':
+            if active is not None:
+                raise ValueError("Nested thebibliography environments are unsupported")
+            _, start = argument(environment.end(), '{', '}')
+            active = start
+            continue
+        if active is None:
+            raise ValueError("Unexpected end of thebibliography")
+        items = []
+        for match in re.finditer(r'(?<!\\)\\bibitem\b', code[active:environment.start()]):
+            item_start = active + match.start()
+            position = active + match.end()
+            while position < len(code) and code[position].isspace():
+                position += 1
+            if position < len(code) and code[position] == '[':
+                _, position = argument(position, '[', ']')
+            key, position = argument(position, '{', '}')
+            if position > environment.start():
+                raise ValueError("Malformed bibitem argument before end of thebibliography")
+            key = key.strip()
+            if not key or re.search(r'[\s{},\\]', key):
+                raise ValueError(f"Unsupported bibitem key {key!r}")
+            items.append((key, item_start, position))
+        if not items and code[active:environment.start()].strip():
+            raise ValueError("No literal bibitem commands found in thebibliography; macro-generated entries are unsupported")
+        for index, (key, item_start, content_start) in enumerate(items):
+            end = items[index + 1][1] if index + 1 < len(items) else environment.start()
+            note = ''.join(note_chars[content_start:end]).strip()
+            if not note:
+                raise ValueError(f"Empty bibitem {key!r}")
+            yield key, note, item_start, end
+        active = None
+    if active is not None:
+        raise ValueError("Unclosed thebibliography environment")
+
+
+def _rewrite_bib_keys(text: str, mapping: Dict[str, str]) -> str:
+    text = re.sub(
+        r'(^\s*@\w+\s*[\{(]\s*)([^,\s]+)(\s*,)',
+        lambda match: match.group(1) + mapping.get(match.group(2), match.group(2)) + match.group(3),
+        text,
+        flags=re.MULTILINE,
+    )
+    field_pattern = re.compile(
+        r'(?:crossref|xdata)\s*=\s*(\{[^{}]*\}|"[^"]*"|[^,\s}]+)',
+        re.IGNORECASE,
+    )
+    edits = []
+    depth = 0
+    outer = ''
+    opener = -1
+    quoted = False
+    escaped = False
+    previous = ''
+    for index, character in enumerate(text):
+        if depth == 0:
+            if index == opener:
+                depth = 1
+                previous = character
+                continue
+            if character == '@':
+                header = re.match(r'@\w+\s*([\{(])', text[index:])
+                if header:
+                    opener = index + header.end() - 1
+                    outer = header.group(1)
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if character == '\\':
+            escaped = True
+            continue
+        if character == '"' and depth > 0:
+            quoted = not quoted
+            continue
+        if quoted:
+            continue
+        if character == '{':
+            depth += 1
+        elif character == '}':
+            if depth > 1 or outer == '{':
+                depth -= 1
+        elif character == ')' and depth == 1 and outer == '(':
+            depth = 0
+        elif depth == 1 and previous == ',' and character.isalpha():
+            match = field_pattern.match(text, index)
+            if match:
+                value = match.group(1)
+                replacement = re.sub(
+                    r'[^,\s{}"]+',
+                    lambda key_match: mapping.get(key_match.group(0), key_match.group(0)),
+                    value,
+                )
+                edits.append((match.start(1), match.end(1), replacement))
+        if not character.isspace():
+            previous = character
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _parse_large_bibtex(text: str) -> Tuple[List[Dict], List[str]]:
+    from pybtex.database import Entry
+    from pybtex.database.input.bibtex import Parser
+
+    class DuplicateTolerantParser(Parser):
+        def __init__(self):
+            super().__init__(person_fields=())
+            self.original_keys = {}
+            self.duplicate_number = 0
+            self.parse_warnings = []
+
+        def process_entry(self, entry_type, key, fields):
+            original_key = key or ""
+            if key is None:
+                key = f"unnamed-{self.unnamed_entry_counter}"
+                self.unnamed_entry_counter += 1
+            while key in self.data.entries:
+                self.duplicate_number += 1
+                key = f"{original_key}__duplicate_{self.duplicate_number}"
+
+            entry = Entry(entry_type.lower())
+            assert entry.fields is not None
+            for field_name, field_value_list in fields or []:
+                entry.fields[field_name.lower()] = self.flatten_value_list(field_value_list)
+            self.original_keys[key] = original_key
+            self.data.add_entry(key, entry)
+
+        def handle_error(self, error):
+            self.parse_warnings.append(str(error))
+
+    parser = DuplicateTolerantParser()
+    parser.parse_string(text)
+    entries = []
+    for synthetic_key, parsed_entry in parser.data.entries.items():
+        entry_type = parsed_entry.type.lower()
+        if entry_type not in STANDARD_TYPES:
+            continue
+        entry = {
+            "ID": parser.original_keys[synthetic_key],
+            "ENTRYTYPE": entry_type,
+        }
+        entry.update({key.lower(): value for key, value in parsed_entry.fields.items()})
+        entries.append(entry)
+    return entries, parser.parse_warnings
+
+
+def _parse_standard_bibtex(text: str, entry_locations: List[Tuple[str, int, int, int, int]]) -> List[Dict]:
+    parser: Any = BibTexParser(common_strings=True)
+    parser.expect_multiple_parse = True
+    batch_start = 0
+    for batch_end in range(
+        BIBTEX_PARSE_BATCH_SIZE,
+        len(entry_locations) + 1,
+        BIBTEX_PARSE_BATCH_SIZE,
+    ):
+        batch_offset = entry_locations[batch_end - 1][4]
+        parser.parse(text[batch_start:batch_offset])
+        batch_start = batch_offset
+    if batch_start < len(text) or not entry_locations:
+        parser.parse(text[batch_start:])
+    return parser.bib_database.entries
+
 
 class BibliographyManager:
     """Main class for managing bibliography files"""
@@ -66,6 +332,9 @@ class BibliographyManager:
         """
         self.root_directory: str = root_directory or os.getcwd()
         self.bib_files: List[Path] = []
+        self.embedded_bib_files: List[Path] = []
+        self.strict_source_errors = False
+        self.include_source_master = False
         self.report_data: Dict = {
             'start_time': None,
             'end_time': None,
@@ -79,6 +348,8 @@ class BibliographyManager:
             'metadata_fixes': [],
             'tex_files_updated': 0,
             'tex_citation_updates': 0,
+            'citation_update_files': [],
+            'parse_warnings': [],
             'final_entries': 0
         }
         self.all_entries: List[Dict] = []
@@ -142,35 +413,37 @@ class BibliographyManager:
         
         return line_numbers
 
-    def _extract_entry_block(self, lines: List[str], start_line: int) -> Tuple[str, int]:
-        """Extract a full BibTeX entry block from a file.
-
-        Args:
-            lines: File contents split into lines with line endings preserved.
-            start_line: 1-based line number where the entry starts.
-
-        Returns:
-            A tuple of (entry_text, end_line).
-        """
-        if start_line < 1 or start_line > len(lines):
-            return "", start_line
-
-        block_lines = []
+    def _extract_entry_locations(self, text: str) -> List[Tuple[str, int, int, int, int]]:
+        """Index entry IDs and source spans without materializing every file line."""
+        locations: List[List[Any]] = []
+        active_index = None
         brace_balance = 0
         started = False
-        end_line = start_line
+        offset = 0
 
-        for line_index in range(start_line - 1, len(lines)):
-            line = lines[line_index]
-            block_lines.append(line)
-            brace_balance += line.count('{') - line.count('}')
-            if '{' in line:
-                started = True
-            if started and brace_balance <= 0:
-                end_line = line_index + 1
-                break
+        for line_number, line in enumerate(StringIO(text), start=1):
+            line_offset = offset
+            offset += len(line)
+            if active_index is None:
+                match = re.match(r'@[a-zA-Z]+\s*\{\s*([^,\s]+)', line)
+                if not match:
+                    continue
+                locations.append([match.group(1).strip(), line_number, line_number, line_offset, offset])
+                active_index = len(locations) - 1
+                brace_balance = line.count('{') - line.count('}')
+                started = '{' in line
+            else:
+                brace_balance += line.count('{') - line.count('}')
+                if '{' in line:
+                    started = True
 
-        return ''.join(block_lines), end_line
+            if active_index is not None and started and brace_balance <= 0:
+                locations[active_index][2] = line_number
+                locations[active_index][4] = offset
+                active_index = None
+
+        return [(key, start_line, end_line, start_offset, end_offset)
+                for key, start_line, end_line, start_offset, end_offset in locations]
     
     def crawl_and_collect(self) -> Tuple[int, int]:
         """Crawl through folders to find all .bib files and collect entries
@@ -183,18 +456,17 @@ class BibliographyManager:
         print(f"{'='*60}")
         print(f"Searching in: {self.root_directory}\n")
         
-        # Ignore backups and generated processed copies so source records retain their keys.
+        # Find all .bib files recursively (exclude master.bib and backups)
         root_path = Path(self.root_directory).resolve()
-        all_bib_files = list(Path(self.root_directory).rglob("*.bib"))
+        all_bib_files = sorted(
+            Path(self.root_directory).rglob("*.bib"),
+            key=lambda path: path.relative_to(self.root_directory).as_posix().casefold(),
+        )
         self.bib_files = [
             bib_file for bib_file in all_bib_files
-            if bib_file.name.lower() != "master.bib"
+            if (self.include_source_master or bib_file.name.lower() != "master.bib")
             and not self._is_generated_workspace_path(bib_file, root_path)
         ]
-        
-        if not self.bib_files:
-            print("⚠️  No .bib files found!")
-            return 0, 0
         
         print(f"✓ Found {len(self.bib_files)} .bib file(s):")
         for i, bib_file in enumerate(self.bib_files, 1):
@@ -207,67 +479,143 @@ class BibliographyManager:
         for bib_file in self.bib_files:
             try:
                 # Extract line numbers first
-                line_numbers = self._extract_line_numbers(str(bib_file))
-                
                 with open(bib_file, encoding='utf-8') as f:
                     file_text = f.read()
-                    file_lines = file_text.splitlines(keepends=True)
-                    entry_start_lines = []
-                    entry_line_occurrences: Dict[str, List[int]] = {}
-                    for line_num, line in enumerate(file_lines, start=1):
-                        match = re.match(r'@[a-zA-Z]+\s*\{\s*([^,\s]+)', line)
-                        if not match:
-                            continue
-                        key = match.group(1).strip()
-                        entry_start_lines.append(line_num)
-                        if key not in entry_line_occurrences:
-                            entry_line_occurrences[key] = []
-                        entry_line_occurrences[key].append(line_num)
-                    # Create a NEW parser for each file to avoid accumulation
-                    parser = BibTexParser(common_strings=True)
-                    db = bibtexparser.load(StringIO(file_text), parser=parser)
-
+                    entry_locations = self._extract_entry_locations(file_text)
+                    parsed_entries: List[Dict] | None = None
+                    if bib_file.stat().st_size >= LARGE_BIB_PARSE_THRESHOLD:
+                        try:
+                            parsed_entries, parse_warnings = _parse_large_bibtex(file_text)
+                            self.report_data['parse_warnings'].extend(parse_warnings)
+                        except ImportError:
+                            parsed_entries = None
+                    if parsed_entries is None:
+                        parsed_entries = _parse_standard_bibtex(file_text, entry_locations)
+                    del file_text
+                    entry_line_occurrences: Dict[str, List[Tuple[int, int]]] = {}
+                    for key, start_line, end_line, _, _ in entry_locations:
+                        entry_line_occurrences.setdefault(key, []).append((start_line, end_line))
                     relative_path = str(bib_file.relative_to(self.root_directory))
                     self.report_data['source_files'][str(bib_file)] = {
                         'relative_path': relative_path,
-                        'text': file_text,
                     }
 
                     fallback_index = 0
-                    for entry in db.entries:
+                    for entry in parsed_entries:
                         # Store source file information and line number
                         entry_id = entry.get('ID', '').strip()
                         id_lines = entry_line_occurrences.get(entry_id, [])
                         if id_lines:
-                            start_line = id_lines.pop(0)
-                        elif fallback_index < len(entry_start_lines):
-                            start_line = entry_start_lines[fallback_index]
+                            start_line, end_line = id_lines.pop(0)
+                        elif fallback_index < len(entry_locations):
+                            _, start_line, end_line, _, _ = entry_locations[fallback_index]
                             fallback_index += 1
                         else:
-                            start_line = line_numbers.get(entry_id, 'N/A')
-                        entry_text = ''
-                        end_line = start_line
-                        if isinstance(start_line, int):
-                            entry_text, end_line = self._extract_entry_block(file_lines, start_line)
+                            start_line = 'N/A'
+                            end_line = start_line
 
                         entry['_source_file'] = str(bib_file)
                         entry['_source_file_display'] = relative_path
                         entry['_line_number'] = start_line
-                        entry['_entry_text'] = entry_text
                         entry['_entry_start_line'] = start_line
                         entry['_entry_end_line'] = end_line
                         self.all_entries.append(entry)
+                    del entry_locations, entry_line_occurrences, parsed_entries
             except Exception as e:
+                if self.strict_source_errors:
+                    raise ValueError(f"Could not read bibliography {bib_file}: {e}") from e
                 print(f"⚠️  Error reading {bib_file}: {e}")
+
+        self.embedded_bib_files = []
+        embedded_targets: Set[Path] = set()
+        for tex_file in sorted(Path(self.root_directory).rglob("*.tex")):
+            if self._is_generated_workspace_path(tex_file, root_path):
+                continue
+            try:
+                text = tex_file.read_text(encoding="utf-8")
+            except UnicodeError as error:
+                if self.strict_source_errors:
+                    raise ValueError(f"Could not inspect LaTeX file {tex_file}: {error}") from error
+                warning = f"Could not inspect {tex_file} for embedded bibliographies: {error}"
+                self.report_data['parse_warnings'].append(warning)
+                print(f"⚠️  {warning}")
+                continue
+            for filename, start, end in _embedded_bib_blocks(text):
+                relative_filename = Path(filename)
+                if relative_filename.is_absolute() or '..' in relative_filename.parts:
+                    raise ValueError(f"Unsafe embedded bibliography filename {filename!r} in {tex_file}")
+                target = (tex_file.parent / relative_filename).resolve()
+                root_target = (root_path / relative_filename).resolve()
+                if (
+                    target.exists()
+                    or root_target.exists()
+                    or target in embedded_targets
+                    or root_target in embedded_targets
+                    or root_target == root_path / 'master.bib'
+                ):
+                    raise ValueError(f"Conflicting embedded bibliography {filename!r} in {tex_file}; resolve the file conflict first")
+                embedded_targets.add(target)
+                embedded_targets.add(root_target)
+                if tex_file not in self.embedded_bib_files:
+                    self.embedded_bib_files.append(tex_file)
+                block = text[start:end]
+                locations = self._extract_entry_locations(block)
+                entries = _parse_standard_bibtex(block, locations)
+                relative_path = str(tex_file.relative_to(self.root_directory))
+                self.report_data['source_files'][str(tex_file)] = {'relative_path': relative_path}
+                lines_by_key: Dict[str, List[Tuple[int, int]]] = {}
+                base_line = text.count('\n', 0, start)
+                for key, first, last, _, _ in locations:
+                    lines_by_key.setdefault(key, []).append((base_line + first, base_line + last))
+                for entry in entries:
+                    lines = lines_by_key.get(entry.get('ID', '').strip(), [])
+                    first, last = lines.pop(0) if lines else ('N/A', 'N/A')
+                    entry.update({
+                        '_source_file': str(tex_file),
+                        '_source_file_display': relative_path,
+                        '_line_number': first,
+                        '_entry_start_line': first,
+                        '_entry_end_line': last,
+                    })
+                    self.all_entries.append(entry)
+            for key, note, start, end in _manual_bibliography_entries(text):
+                if tex_file not in self.embedded_bib_files:
+                    self.embedded_bib_files.append(tex_file)
+                relative_path = str(tex_file.relative_to(self.root_directory))
+                self.report_data['source_files'][str(tex_file)] = {'relative_path': relative_path}
+                first = text.count('\n', 0, start) + 1
+                last = text.count('\n', 0, end) + 1
+                self.all_entries.append({
+                    'ID': key,
+                    'ENTRYTYPE': 'misc',
+                    'note': note,
+                    '_manual_bibitem': True,
+                    '_source_file': str(tex_file),
+                    '_source_file_display': relative_path,
+                    '_line_number': first,
+                    '_entry_start_line': first,
+                    '_entry_end_line': last,
+                })
+
+        manual_keys = [entry['ID'] for entry in self.all_entries if entry.get('_manual_bibitem')]
+        key_counts = Counter(entry.get('ID') for entry in self.all_entries)
+        for key in manual_keys:
+            if key_counts[key] > 1:
+                raise ValueError(f"Conflicting manual bibliography key {key!r}; resolve the conflict first")
+        if manual_keys:
+            warning = ("Manual bibitem references retain their original keys and formatting; "
+                       "their free-form text is exported as BibTeX notes.")
+            self.report_data['parse_warnings'].append(warning)
+            print(f"⚠️  {warning}")
         
         print(f"\n✓ Collected {len(self.all_entries)} total entries\n")
         
         # Store report data
-        self.report_data['files_found'] = len(self.bib_files)
+        self.report_data['files_found'] = len(self.bib_files) + len(self.embedded_bib_files)
         self.report_data['initial_entries'] = len(self.all_entries)
         
-        return len(self.bib_files), len(self.all_entries)
-    
+        return self.report_data['files_found'], len(self.all_entries)
+
     @staticmethod
     def _is_generated_workspace_path(path: Path, root_path: Path) -> bool:
         """Exclude backups and processed output from a later source scan."""
@@ -277,8 +625,9 @@ class BibliographyManager:
             return False
         return any(
             part.startswith("backup_")
-            or (index == 0 and (part == "processed" or part.startswith("processed_")))
-            for index, part in enumerate(relative_parts)
+            or part == "processed"
+            or part.startswith("processed_")
+            for part in relative_parts
         )
 
     def normalize_string(self, text: str) -> str:
@@ -327,44 +676,6 @@ class BibliographyManager:
         
         return last_names
 
-    def _professor_author_fragment(self, author_string: str) -> str:
-        """Build a compact author fragment for professor-style keys.
-
-        Examples:
-            Huang -> hua
-            Huang and Wang -> huw
-            Huang and Wang and Zhao -> hwz
-        """
-        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
-        surnames = [name for name in surnames if name]
-        if not surnames:
-            return "unk"
-        if len(surnames) == 1:
-            return surnames[0][:3] or "unk"
-        if len(surnames) == 2:
-            return f"{surnames[0][:2]}{surnames[1][:1]}" or "unk"
-        return ''.join(name[:1] for name in surnames[:3]) or "unk"
-
-    def _strict_professor_author_fragment(self, author_string: str) -> str:
-        """Build the professor's strict key fragment using the same naming rule."""
-        return self._professor_author_fragment(author_string)
-
-    def _author_etal_fragment(self, author_string: str) -> str:
-        """Build an author-et-al fragment for citation keys."""
-        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
-        surnames = [name for name in surnames if name]
-        if not surnames:
-            return "unk"
-        if len(surnames) == 1:
-            return surnames[0]
-        return f"{surnames[0]}etal"
-
-    def _lastname_year_fragment(self, author_string: str) -> str:
-        """Build a lastname-only fragment from the first author."""
-        surnames = [re.sub(r'[^a-z0-9]', '', name.lower()) for name in self.extract_authors_lastname(author_string)]
-        surnames = [name for name in surnames if name]
-        return surnames[0] if surnames else "unk"
-    
     def compute_similarity(self, entry1: Dict, entry2: Dict) -> float:
         """Compute similarity score between two entries
         
@@ -377,8 +688,12 @@ class BibliographyManager:
         score = 0
         
         # 1. DOI match (if present, this is almost certain duplicate)
-        doi1 = entry1.get('doi', '').strip().lower()
-        doi2 = entry2.get('doi', '').strip().lower()
+        doi1 = entry1.get('_duplicate_doi')
+        if doi1 is None:
+            doi1 = str(entry1.get('doi', '')).strip().lower()
+        doi2 = entry2.get('_duplicate_doi')
+        if doi2 is None:
+            doi2 = str(entry2.get('doi', '')).strip().lower()
         if doi1 and doi2:
             if doi1 == doi2:
                 return 100  # Perfect match
@@ -386,8 +701,12 @@ class BibliographyManager:
                 return 0  # Different DOIs = different papers
         
         # 2. Title similarity (most important)
-        title1 = self.normalize_string(entry1.get('title', ''))
-        title2 = self.normalize_string(entry2.get('title', ''))
+        title1 = entry1.get('_duplicate_title')
+        if title1 is None:
+            title1 = self.normalize_string(entry1.get('title', ''))
+        title2 = entry2.get('_duplicate_title')
+        if title2 is None:
+            title2 = self.normalize_string(entry2.get('title', ''))
         
         if not title1 or not title2:
             return 0
@@ -399,13 +718,21 @@ class BibliographyManager:
             title_score = 100 if title1 == title2 else 0
         
         # 3. Year match
-        year1 = entry1.get('year', '')
-        year2 = entry2.get('year', '')
+        year1 = entry1.get('_duplicate_year')
+        if year1 is None:
+            year1 = str(entry1.get('year', '')).strip()
+        year2 = entry2.get('_duplicate_year')
+        if year2 is None:
+            year2 = str(entry2.get('year', '')).strip()
         year_match = (year1 == year2) if (year1 and year2) else False
         
         # 4. Author similarity
-        author1 = self.normalize_string(entry1.get('author', ''))
-        author2 = self.normalize_string(entry2.get('author', ''))
+        author1 = entry1.get('_duplicate_author')
+        if author1 is None:
+            author1 = self.normalize_string(entry1.get('author', ''))
+        author2 = entry2.get('_duplicate_author')
+        if author2 is None:
+            author2 = self.normalize_string(entry2.get('author', ''))
         
         if author1 and author2:
             if fuzz:
@@ -441,18 +768,100 @@ class BibliographyManager:
             print("No entries to check for duplicates.\n")
             return 0
         
-        # Track which entries are already grouped
+        # Prepare comparison fields once. Re-normalizing title and author text
+        # inside every candidate comparison is costly for large imports.
+        title_token_counts: Dict[str, int] = {}
+        for entry in self.all_entries:
+            entry['_duplicate_doi'] = str(entry.get('doi', '')).strip().lower()
+            entry['_duplicate_title'] = self.normalize_string(entry.get('title', ''))
+            entry['_duplicate_author'] = self.normalize_string(entry.get('author', ''))
+            entry['_duplicate_year'] = str(entry.get('year', '')).strip()
+            tokens = {
+                token for token in entry['_duplicate_title'].split()
+                if len(token) > 3 and token not in WEAK_TITLE_WORDS
+            }
+            entry['_duplicate_tokens'] = tokens
+            for token in tokens:
+                title_token_counts[token] = title_token_counts.get(token, 0) + 1
+
+        # Exact fingerprints are handled in one pass. This avoids comparing a
+        # large number of identical records pair by pair.
+        exact_indexes: Dict[str, List[int]] = {}
+        for index, entry in enumerate(self.all_entries):
+            doi = entry['_duplicate_doi']
+            title = entry['_duplicate_title']
+            author = entry['_duplicate_author']
+            year = entry['_duplicate_year']
+            if doi:
+                exact_indexes.setdefault(f'doi:{doi}', []).append(index)
+            if title and author and year:
+                exact_indexes.setdefault(f'metadata:{title}|{author}|{year}|{doi}', []).append(index)
+
         grouped = set()
         self.duplicate_groups = []
+        candidate_indexes: Dict[str, Set[int]] = {}
+        for index, entry in enumerate(self.all_entries):
+            doi = entry['_duplicate_doi']
+            title = entry['_duplicate_title']
+            if doi:
+                candidate_indexes.setdefault(f'doi:{doi}', set()).add(index)
+            if title:
+                candidate_indexes.setdefault(f'title:{title}', set()).add(index)
+                for token in entry['_duplicate_tokens']:
+                    candidate_indexes.setdefault(f'token:{token}', set()).add(index)
+
+        parents = list(range(n))
+
+        def find_parent(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for indexes in exact_indexes.values():
+            if len(indexes) < 2:
+                continue
+            first = find_parent(indexes[0])
+            for index in indexes[1:]:
+                parent = find_parent(index)
+                if parent != first:
+                    parents[parent] = first
+
+        exact_groups: Dict[int, List[int]] = {}
+        for index in range(n):
+            root = find_parent(index)
+            exact_groups.setdefault(root, []).append(index)
+        for indexes in exact_groups.values():
+            if len(indexes) > 1:
+                self.duplicate_groups.append(indexes)
+                grouped.update(indexes)
         
-        # Compare all pairs
         for i in range(n):
             if i in grouped:
                 continue
             
             current_group = [i]
+            entry = self.all_entries[i]
+            title = entry['_duplicate_title']
+            candidate_set = set(candidate_indexes.get(f'title:{title}', set()))
+            token_candidates = [
+                (title_token_counts[token], token)
+                for token in entry['_duplicate_tokens']
+            ]
+            if token_candidates:
+                _, rarest_token = min(token_candidates)
+                candidate_set.update(candidate_indexes.get(f'token:{rarest_token}', set()))
+            candidate_set.discard(i)
+
+            # Common title words can produce enormous buckets. Exact matches
+            # above are retained, but fuzzy matching is intentionally skipped
+            # for a pathological bucket to keep runtime bounded.
+            if len(candidate_set) > MAX_FUZZY_BUCKET_SIZE:
+                continue
             
-            for j in range(i + 1, n):
+            for j in sorted(candidate_set):
+                if j <= i:
+                    continue
                 if j in grouped:
                     continue
                 
@@ -581,24 +990,18 @@ class BibliographyManager:
             print("✓ No duplicates to remove.\n")
             return
         
-        # Create set of indices to remove
-        to_remove = set()
-        merged_entries = []
-        
+        grouped_indices: Set[int] = set()
+        merged_at_index: Dict[int, Dict] = {}
         for group in self.duplicate_groups:
-            # Merge the group
-            merged = self.merge_duplicate_entries(group)
-            merged_entries.append(merged)
-            
-            # Mark all original entries for removal
-            to_remove.update(group)
-        
-        # Keep only non-duplicate entries
-        deduplicated = [entry for i, entry in enumerate(self.all_entries) 
-                       if i not in to_remove]
-        
-        # Add merged entries
-        deduplicated.extend(merged_entries)
+            merged_at_index[min(group)] = self.merge_duplicate_entries(group)
+            grouped_indices.update(group)
+
+        deduplicated = []
+        for index, entry in enumerate(self.all_entries):
+            if index in merged_at_index:
+                deduplicated.append(merged_at_index[index])
+            elif index not in grouped_indices:
+                deduplicated.append(entry)
         
         original_count = len(self.all_entries)
         self.all_entries = deduplicated
@@ -614,85 +1017,71 @@ class BibliographyManager:
         self,
         entry: Dict,
         existing_keys: Set[str],
-        citekey_format: str = "{authorinitials}{year}",
-        entry_index: int = 1,
     ) -> str:
-        """Generate a citation key for an entry using a user-defined format string.
-        Supported fields: {author}, {year}, {title}, {titleword}, {author2}, etc.
-        """
-        # Extract up to first two author surnames
+        """Generate a key from author surname initials and publication year."""
         authors = self.extract_authors_lastname(entry.get('author', ''))
-        clean_authors = [re.sub(r'[^a-z0-9]', '', a.lower()) for a in authors if a]
-        author = clean_authors[0] if clean_authors else 'unknown'
-        author2 = clean_authors[1] if len(clean_authors) > 1 else ''
-        authorstem = self._professor_author_fragment(entry.get('author', ''))
-        authorstrict = self._strict_professor_author_fragment(entry.get('author', ''))
-        authoretal = self._author_etal_fragment(entry.get('author', ''))
-        lastname = self._lastname_year_fragment(entry.get('author', ''))
-
-        # Extract 4-digit year if available
-        year_raw = str(entry.get('year', '0000'))
+        initials = []
+        for surname in authors:
+            surname = re.sub(
+                r'\\(?:AA|aa|O|o|L|l)\b',
+                lambda match: {'AA': 'A', 'aa': 'a', 'O': 'O', 'o': 'o', 'L': 'L', 'l': 'l'}[match.group(0)[1:]],
+                surname,
+            )
+            surname = re.sub(
+                r'\\[\'"`^~=\.]\s*\{?([A-Za-z])\}?',
+                r'\1',
+                surname,
+            )
+            surname = re.sub(r'\\[A-Za-z]+\s*\{([A-Za-z])\}', r'\1', surname)
+            surname = surname.replace('{', '').replace('}', '')
+            normalized_surname = unicodedata.normalize('NFKD', surname)
+            ascii_surname = normalized_surname.encode('ascii', 'ignore').decode('ascii')
+            initial = next(
+                (character.upper() for character in ascii_surname if character.isalpha()),
+                '',
+            )
+            if initial:
+                initials.append(initial)
+        year_raw = str(entry.get('year', ''))
         year_match = re.search(r'\d{4}', year_raw)
         year = year_match.group(0) if year_match else '0000'
+        base_key = (''.join(initials) or 'X') + year
 
-        # Prefer distinctive title tokens over filler and publication labels.
-        title = self.normalize_string(entry.get('title', ''))
-        title_words = [
-            word for word in title.split()
-            if len(word) > 3 and word not in WEAK_TITLE_WORDS
-        ]
-        titleword = title_words[0] if title_words else 'paper'
-        titleword2 = title_words[1] if len(title_words) > 1 else ''
-        title_part = "-".join(title_words[:2]) if title_words else 'paper'
-        authorinitials = ''.join(name[0].upper() for name in clean_authors if name) or 'X'
-        numeric = str(entry_index)
+        def alphabetic_suffix(index: int) -> str:
+            suffix = ''
+            while index:
+                index, remainder = divmod(index - 1, 26)
+                suffix = chr(ord('a') + remainder) + suffix
+            return suffix
 
-        # Compose key using format string
-        key = citekey_format.format(
-            author=author,
-            author2=author2,
-            authorstem=authorstem,
-            authorstrict=authorstrict,
-            authoretal=authoretal,
-            lastname=lastname,
-            authorinitials=authorinitials,
-            year=year,
-            numeric=numeric,
-            title=title,
-            titleword=titleword,
-            titleword2=titleword2,
-            title_part=title_part
-        )
-
-        # Keep the default compact policy uppercase, but retain legacy casing for other formats.
-        compact_initials = citekey_format == "{authorinitials}{year}"
-        normalized_key = key.replace(' ', '-')
-        if compact_initials:
-            key = re.sub(r'[^A-Za-z0-9\-]', '', normalized_key)
-        else:
-            key = re.sub(r'[^a-z0-9\-]', '', normalized_key.lower())
-
-        # Ensure uniqueness
-        base_key = key
-        counter = 1
+        key = base_key
+        suffix_index = 0
         while key in existing_keys:
-            suffix = chr(96 + counter)
-            key = f"{base_key}{suffix}" if compact_initials else f"{base_key}-{suffix}"
-            counter += 1
+            suffix_index += 1
+            key = base_key + alphabetic_suffix(suffix_index)
         return key
     
-    def fix_citation_keys(self, citekey_format: str = "{authorinitials}{year}"):
-        """Regenerate citation keys with user-defined naming scheme"""
+    def fix_citation_keys(self):
+        """Normalize citation keys to surname initials, year, and ordered suffixes."""
         print(f"\n{'='*60}")
         print(f"STEP 3: Fixing citation keys (labels)...")
         print(f"{'='*60}\n")
         
-        existing_keys = set()
+        existing_keys = {
+            entry['ID'] for entry in self.all_entries if entry.get('_manual_bibitem')
+        }
         key_changes = []
         key_audit = []
         metadata_fixes = []
-        
-        for entry_index, entry in enumerate(self.all_entries, start=1):
+        for entry in self.all_entries:
+            if entry.get('_manual_bibitem'):
+                key_audit.append({
+                    'Original Raw Key': entry['ID'],
+                    'Normalized Key': entry['ID'],
+                    'Source Title': '',
+                    'Warning': 'Manual bibitem key preserved; metadata is unstructured',
+                })
+                continue
             for field in ('author', 'title', 'year'):
                 if not str(entry.get(field, '')).strip():
                     metadata_fixes.append({
@@ -712,23 +1101,25 @@ class BibliographyManager:
                     })
 
             old_key = entry.get('ID', 'NO_ID')
-            new_key = self.generate_citation_key(entry, existing_keys, citekey_format, entry_index)
+            new_key = self.generate_citation_key(
+                entry,
+                existing_keys,
+            )
             existing_keys.add(new_key)
             entry['ID'] = new_key
-            title_words = [
-                word for word in self.normalize_string(entry.get('title', '')).split()
-                if len(word) > 3 and word not in WEAK_TITLE_WORDS
-            ]
-            warning = ''
-            if not title_words:
-                warning = 'No distinctive title words; used paper fallback'
-            elif len(title_words) == 1:
-                warning = 'Only one distinctive title word was available'
             key_audit.append({
                 'Original Raw Key': old_key,
                 'Normalized Key': new_key,
                 'Source Title': entry.get('title', ''),
-                'Warning': warning,
+                'Warning': (
+                    'No author surname; used X fallback'
+                    if not self.extract_authors_lastname(entry.get('author', ''))
+                    else ''
+                ) + (
+                    '; no four-digit year; used 0000'
+                    if not re.search(r'\d{4}', str(entry.get('year', '')))
+                    else ''
+                ),
             })
             if old_key != new_key:
                 key_changes.append((old_key, new_key))
@@ -737,6 +1128,16 @@ class BibliographyManager:
         self.report_data['keys_changed'] = key_changes
         self.report_data['key_audit'] = key_audit
         self.report_data['metadata_fixes'] = metadata_fixes
+        key_mapping = {old: new for old, new in key_changes if old and new and old != new}
+        for entry in self.all_entries:
+            for field in ('crossref', 'xdata'):
+                value = entry.get(field)
+                if isinstance(value, str):
+                    entry[field] = re.sub(
+                        r'[^,\s]+',
+                        lambda match: key_mapping.get(match.group(0), match.group(0)),
+                        value,
+                    )
         
         print(f"✓ Regenerated {len(key_changes)} citation keys")
         
@@ -773,9 +1174,19 @@ class BibliographyManager:
         writer = BibTexWriter()
         writer.indent = '  '
         writer.order_entries_by = ('ID',)
-        
+        output = writer.write(self.master_db)
+        manual_entries = {
+            entry['ID']: entry['note'] for entry in self.all_entries if entry.get('_manual_bibitem')
+        }
+        if manual_entries:
+            parsed = bibtexparser.loads(output)
+            parsed_entries = {entry.get('ID'): entry.get('note') for entry in parsed.entries}
+            for key, note in manual_entries.items():
+                if parsed_entries.get(key) != note:
+                    raise ValueError(f"Manual bibitem {key!r} cannot be safely exported as a BibTeX note")
+
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(writer.write(self.master_db))
+            f.write(output)
         
         # Ensure file is closed and flushed
         import time
@@ -786,83 +1197,54 @@ class BibliographyManager:
         
         return output_path
     
-    def push_to_folders(self, master_file: str, create_backup: bool = True):
-        """Push master bibliography back to original folders
-        
-        Args:
-            master_file: Path to master.bib file
-            create_backup: Whether to create backups of original files
-        """
-        print(f"\n{'='*60}")
-        print(f"STEP 4: Pushing master.bib to original folders...")
-        print(f"{'='*60}\n")
-        
-        if not self.bib_files:
-            print("⚠️  No original .bib files to update.\n")
-            return
-        
-        # Get unique directories
-        directories = set(bib_file.parent for bib_file in self.bib_files)
-        master_path = Path(master_file).resolve()
-        mapping: Dict[str, str] = {}
-        if self.report_data.get('keys_changed'):
-            mapping = {old: new for old, new in self.report_data['keys_changed'] if old and new}
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        for directory in directories:
-            # Create backup directory
-            if create_backup:
-                backup_dir = directory / f"backup_{timestamp}"
-                backup_dir.mkdir(exist_ok=True)
-                
-                # Backup all .bib files in this directory
-                for bib_file in directory.glob("*.bib"):
-                    if bib_file.resolve() == master_path:
-                        continue
-                    backup_path = backup_dir / bib_file.name
-                    try:
-                        shutil.copy2(bib_file, backup_path)
-                    except (PermissionError, OSError):
-                        # File might be locked, wait and retry
-                        import time
-                        time.sleep(0.5)
-                        try:
-                            shutil.copy2(bib_file, backup_path)
-                        except Exception as e:
-                            print(f"⚠️  Could not backup {bib_file.name}: {e}")
-                
-                print(f"✓ Backed up .bib files from: {directory.relative_to(self.root_directory)}")
-                print(f"  → {backup_dir.relative_to(self.root_directory)}/")
+    def create_processed_copy(self) -> Path:
+        """Create an Overleaf-ready copy without changing any source files."""
+        source_root = Path(self.root_directory).resolve()
+        output_name = "processed"
+        output_root = source_root / output_name
+        if output_root.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_name = f"processed_{timestamp}"
+            output_root = source_root / output_name
+            suffix = 1
+            while output_root.exists():
+                output_root = source_root / f"{output_name}_{suffix}"
+                suffix += 1
 
-            # After creating backups, update citation keys in original .bib files.
-            if mapping:
-                try:
-                    self._update_source_files_keys(directory, mapping)
-                except Exception:
-                    # Non-fatal: continue even if updating sources fails
-                    pass
-            
-            # Copy master.bib to this directory
-            dest_path = (directory / "master.bib").resolve()
-            if dest_path == master_path:
-                print(f"⚠️  Skipping copy to source directory: {directory.relative_to(self.root_directory)}/")
-                continue
-            try:
-                shutil.copy2(master_file, dest_path)
-            except (PermissionError, OSError):
-                # File might be locked, wait and retry
-                import time
-                time.sleep(0.5)
-                shutil.copy2(master_file, dest_path)
-            
-            print(f"✓ Copied master.bib to: {directory.relative_to(self.root_directory)}/\n")
+        def ignore_generated(directory: str, names: List[str]) -> Set[str]:
+            return {
+                name for name in names
+                if name.startswith(("backup_", "processed_")) or name in {".git", "processed"}
+            }
 
-        # Update LaTeX citations globally under root directory once.
-        if mapping:
-            self._update_latex_citations(mapping)
-        
-        print(f"✓ Master bibliography distributed to {len(directories)} folder(s)\n")
+        original_root = self.root_directory
+        try:
+            shutil.copytree(source_root, output_root, ignore=ignore_generated)
+            self.root_directory = str(output_root)
+            self.update_source_citations()
+            master_path = Path(self.create_master_bibliography(str(output_root / "master.bib")))
+            source_directories = {
+                output_root / bib_file.resolve().relative_to(source_root).parent
+                for bib_file in self.bib_files
+            }
+            for directory in source_directories:
+                destination = directory / "master.bib"
+                if destination.resolve() != master_path.resolve():
+                    shutil.copy2(master_path, destination)
+        except Exception:
+            shutil.rmtree(output_root, ignore_errors=True)
+            raise
+        finally:
+            self.root_directory = original_root
+
+        self.report_data["processed_copy_path"] = str(output_root)
+        print(f"✓ Processed project copy saved to: {output_root}")
+        print("  Original bibliography and LaTeX files were left unchanged.")
+        return output_root
+
+    def push_to_folders(self, master_file: str | None = None, create_backup: bool = True):
+        """Create a processed project copy for Dropbox/Overleaf without editing sources."""
+        return self.create_processed_copy()
 
     def _compute_changed_lines(self, original_text: str, updated_text: str) -> List[int]:
         """Return 1-based line numbers that changed between two texts."""
@@ -920,8 +1302,6 @@ class BibliographyManager:
                     # Save to report mapping
                     relpath = str(bib_file.relative_to(self.root_directory))
                     file_changes[relpath] = {
-                        'original': original_text,
-                        'updated': updated_text,
                         'changed_lines': changed_lines,
                     }
 
@@ -929,8 +1309,9 @@ class BibliographyManager:
                     with open(bib_file, 'w', encoding='utf-8') as f:
                         f.write(updated_text)
 
-            except OSError as error:
-                raise OSError(f"Could not update bibliography keys in {bib_file}") from error
+            except Exception:
+                # ignore file-specific errors
+                continue
 
         # Update report_data
         self.report_data['file_changes'] = file_changes
@@ -1015,15 +1396,24 @@ class BibliographyManager:
                 with open(tex_file, encoding='utf-8') as f:
                     original_text = f.read()
 
-                updated_text, replaced_count = self._replace_citation_keys_in_tex(original_text, mapping)
+                parts = []
+                last = 0
+                replaced_count = 0
+                for _, start, end in _embedded_bib_blocks(original_text):
+                    updated, count = self._replace_citation_keys_in_tex(original_text[last:start], mapping)
+                    parts.extend((updated, _rewrite_bib_keys(original_text[start:end], mapping)))
+                    replaced_count += count
+                    last = end
+                updated, count = self._replace_citation_keys_in_tex(original_text[last:], mapping)
+                parts.append(updated)
+                replaced_count += count
+                updated_text = ''.join(parts)
                 if updated_text == original_text:
                     continue
 
                 changed_lines = self._compute_changed_lines(original_text, updated_text)
                 relpath = str(tex_file.relative_to(self.root_directory))
                 file_changes[relpath] = {
-                    'original': original_text,
-                    'updated': updated_text,
                     'changed_lines': changed_lines,
                 }
 
@@ -1038,6 +1428,41 @@ class BibliographyManager:
         self.report_data['file_changes'] = file_changes
         self.report_data['tex_files_updated'] = tex_files_updated
         self.report_data['tex_citation_updates'] = tex_citation_updates
+
+    def update_source_citations(self):
+        """Rewrite source BibTeX keys and LaTeX citations after key normalization."""
+        mapping = {
+            old: new
+            for old, new in self.report_data.get('keys_changed', [])
+            if old and new and old != new
+        }
+        if not mapping:
+            self.report_data['citation_update_files'] = []
+            return
+
+        file_changes: Dict[str, Dict] = self.report_data.get('file_changes', {})
+        root_path = Path(self.root_directory).resolve()
+        for bib_file in Path(self.root_directory).rglob('*.bib'):
+            if self._is_generated_workspace_path(bib_file, root_path):
+                continue
+            try:
+                original_text = bib_file.read_text(encoding='utf-8')
+                updated_text = _rewrite_bib_keys(original_text, mapping)
+                if updated_text != original_text:
+                    bib_file.write_text(updated_text, encoding='utf-8')
+                    relpath = str(bib_file.relative_to(self.root_directory))
+                    file_changes[relpath] = {
+                        'changed_lines': self._compute_changed_lines(original_text, updated_text),
+                    }
+            except OSError as error:
+                raise OSError(f"Could not update bibliography keys in {bib_file}") from error
+
+        self.report_data['file_changes'] = file_changes
+        self._update_latex_citations(mapping)
+        self.report_data['citation_update_files'] = sorted(
+            path for path in file_changes
+            if path.lower().endswith(('.bib', '.tex'))
+        )
     
     def generate_html_report(self, output_path: str | None = None) -> str:
         """Generate a detailed HTML report of the processing
@@ -1377,7 +1802,7 @@ class BibliographyManager:
         
         Args:
             similarity_threshold: Threshold for duplicate detection (0-100)
-            push_back: Whether to push master.bib back to original folders
+            push_back: Whether to create a processed project copy beside the source
             generate_report: Whether to generate HTML report
         """
         print("\n" + "="*60)
@@ -1400,12 +1825,10 @@ class BibliographyManager:
         # Step 3: Fix citation keys
         self.fix_citation_keys()
         
-        # Create master bibliography
-        master_path = self.create_master_bibliography()
-        
-        # Step 4: Push back (optional)
         if push_back:
-            self.push_to_folders(master_path, create_backup=True)
+            master_path = str(self.create_processed_copy() / "master.bib")
+        else:
+            master_path = self.create_master_bibliography()
         
         # End timing
         self.report_data['end_time'] = datetime.now()
@@ -1456,7 +1879,7 @@ def main():
         choice = input("\nSelect option: ").strip()
         
         if choice == '1':
-            push = input("\nPush master.bib back to folders? (y/n): ").strip().lower() == 'y'
+            push = input("\nCreate a processed project copy beside the source? (y/n): ").strip().lower() == 'y'
             manager.run_full_pipeline(similarity_threshold=85.0, push_back=push)
             break
             
@@ -1468,11 +1891,11 @@ def main():
             manager.find_duplicates(threshold=threshold)
             manager.remove_duplicates()
             manager.fix_citation_keys()
-            master_path = manager.create_master_bibliography()
-            
-            push = input("\nPush master.bib back to folders? (y/n): ").strip().lower() == 'y'
+            push = input("\nCreate a processed project copy beside the source? (y/n): ").strip().lower() == 'y'
             if push:
-                manager.push_to_folders(master_path)
+                master_path = str(manager.create_processed_copy() / "master.bib")
+            else:
+                master_path = manager.create_master_bibliography()
             
             print("\n✓ Done!")
             break

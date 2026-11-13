@@ -15,12 +15,15 @@ from pathlib import Path
 import tarfile
 from typing import Optional
 from bib import BibliographyManager
+from project_batch import discover_projects, process_projects, validate_project_roots
 import importlib
 from typing import TYPE_CHECKING, Any
+import json
 import tempfile
 import zipfile
 import shutil
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
@@ -46,6 +49,40 @@ def _resolve_appearance_mode(selection: str, system_mode: str) -> str:
     return normalized_selection
 
 
+def _settings_file_path() -> Path:
+    if os.name == "nt":
+        settings_root = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        settings_root = Path.home() / "Library" / "Application Support"
+    else:
+        settings_root = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return settings_root / "BibTeXManager" / "settings.json"
+
+
+def _load_last_source(settings_file: Optional[Path] = None) -> str:
+    settings_path = settings_file or _settings_file_path()
+    if not settings_path.exists():
+        return ""
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    if not isinstance(settings, dict):
+        raise ValueError("The saved app settings must contain a JSON object.")
+    source_path = settings.get("last_source_path", "")
+    if not isinstance(source_path, str):
+        raise ValueError("The saved project path in app settings is invalid.")
+    return source_path
+
+
+def _save_last_source(source_path: str, settings_file: Optional[Path] = None) -> None:
+    settings_path = settings_file or _settings_file_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = settings_path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps({"last_source_path": source_path}, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(settings_path)
+
+
 def _collect_tex_documents(root: Path) -> dict[str, str]:
     """Read project LaTeX files by relative path for the document preview."""
     return {
@@ -53,7 +90,6 @@ def _collect_tex_documents(root: Path) -> dict[str, str]:
         for tex_file in sorted(root.rglob("*.tex"))
         if tex_file.is_file()
     }
-
 
 
 def _find_tex_citation_spans(content: str) -> list[tuple[int, int]]:
@@ -74,14 +110,6 @@ def _next_tex_citation_index(current: int, direction: int, citation_count: int) 
 
 class ModernBibGUI:
     """Modern GUI for Bibliography Manager using CustomTkinter"""
-
-    def _on_citekey_rule_changed(self, rule):
-        # Only update entry if it exists
-        if hasattr(self, 'citekey_custom_entry'):
-            if rule == "custom":
-                self.citekey_custom_entry.configure(state="normal")
-            else:
-                self.citekey_custom_entry.configure(state="disabled")
     
     def __init__(self):
         """Initialize the modern GUI"""
@@ -104,12 +132,22 @@ class ModernBibGUI:
         self._current_changed_display_lines = []
         self._current_changed_idx = -1
         self._tex_documents = {}
+        self._document_report_data = {}
+        self._batch_document_projects = {}
         self._tex_citation_spans = []
         self._current_tex_citation_idx = -1
+        self._key_review_event = None
+        self._key_review_approved = False
+        self._key_review_items = []
+        self._key_review_push_back = True
         self._show_unchanged_var = ctk.BooleanVar(value=True)
         self._diff_context_lines = 2
         self._last_master_path = None
         self._last_cleaned_zip = None
+        self._batch_project = None
+        self._batch_progress = None
+        self._review_source = None
+        self._batch_outputs = []
         self._sidebar_mode = None
         self._sidebar_icon_buttons = {}
         self._sidebar_sections = {}
@@ -146,6 +184,7 @@ class ModernBibGUI:
         self._library_left_minsize = 220
         self._custom_collections: dict[str, set[str]] = {}
         self._active_collection_name: Optional[str] = None
+        self._selected_action_collection: Optional[str] = None
         self._library_notes: dict[str, str] = {}
         self._library_tags: dict[str, str] = {}
         self._selected_library_key: str = ""
@@ -159,12 +198,9 @@ class ModernBibGUI:
         self.fixes_scrollbar = None
         self.fixes_h_scrollbar = None
         
-        # Citation key normalization rule (default and custom)
-        self.citekey_rule_var = ctk.StringVar(value="compact-initials")
-        self.citekey_custom_var = ctk.StringVar(value="{author}-{year}-{title}")
-
         # Build UI
         self._build_ui()
+        self._restore_last_source()
 
     def _theme_palette(self, mode: Optional[str] = None) -> dict[str, str]:
         mode = (mode or self._theme_mode or "dark").lower()
@@ -286,6 +322,15 @@ class ModernBibGUI:
             text_color_disabled=palette["muted2"],
         )
         set_cfg(getattr(self, "library_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "key_review_tab", None), fg_color=palette["panel2"])
+        set_cfg(getattr(self, "key_review_header", None), fg_color=palette["card"], border_color=palette["border"])
+        set_cfg(getattr(self, "key_review_toolbar", None), fg_color="transparent")
+        set_cfg(getattr(self, "key_review_table_frame", None), fg_color=palette["surface"])
+        set_cfg(getattr(self, "key_review_status_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "key_review_project_label", None), text_color=palette["accent"])
+        set_cfg(getattr(self, "key_review_path_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "key_review_count_label", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "key_review_search_entry", None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
         set_cfg(getattr(self, "library_left_shell", None), fg_color="transparent")
         set_cfg(getattr(self, "library_left_content", None), fg_color=palette["panel2"])
         set_cfg(getattr(self, "library_left_frame", None), fg_color=palette["card"], border_color=palette["border"])
@@ -298,6 +343,13 @@ class ModernBibGUI:
         set_cfg(getattr(self, "library_tree_frame", None), fg_color=palette["surface"])
         set_cfg(getattr(self, "library_right_frame", None), fg_color=palette["card"])
         set_cfg(getattr(self, "library_detail_actions", None), fg_color="transparent")
+        set_cfg(getattr(self, "library_selected_title", None), text_color=palette["text"])
+        set_cfg(getattr(self, "library_selected_key", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "library_action_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "metadata_session_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "notes_session_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "tags_session_hint", None), text_color=palette["muted"])
+        set_cfg(getattr(self, "library_action_collection_menu", None), fg_color=palette["button"], button_color=palette["button_hover"], button_hover_color=palette["button_hover"], text_color=palette["button_text"])
         set_cfg(getattr(self, "library_details_tabs", None), fg_color=palette["card"])
         set_cfg(getattr(self, "library_metadata_frame", None), fg_color=palette["card"])
 
@@ -349,19 +401,31 @@ class ModernBibGUI:
         set_cfg(getattr(self, "fixes_diff_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
         set_cfg(getattr(self, "duplicates_text", None), fg_color=palette["textbox_bg"], text_color=palette["text"])
 
-        for entry_name in ("dir_entry", "collection_entry", "citekey_custom_entry", "library_search_entry"):
+        for entry_name in ("dir_entry", "collection_entry", "library_search_entry"):
             set_cfg(getattr(self, entry_name, None), fg_color=palette["input_bg"], border_color=palette["input_border"], text_color=palette["text"], placeholder_text_color=palette["muted2"])
 
-        for button_name in ("browse_btn", "source_file_btn", "demo_btn", "clear_btn", "run_btn", "cancel_btn", "view_report_btn", "library_add_btn", "library_delete_btn", "library_export_btn", "copy_key_btn", "add_selected_btn", "review_duplicate_btn", "meta_save_btn", "library_note_save_btn", "library_tag_save_btn", "collection_add_btn", "add_to_collection_btn", "remove_collection_btn"):
+        for button_name in ("browse_btn", "source_file_btn", "demo_btn", "clear_btn", "run_btn", "cancel_btn", "view_report_btn", "key_review_confirm_btn", "key_review_cancel_btn", "library_add_btn", "library_delete_btn", "library_export_btn", "copy_key_btn", "add_selected_btn", "review_duplicate_btn", "meta_save_btn", "library_note_save_btn", "library_tag_save_btn", "collection_add_btn", "add_to_collection_btn", "remove_collection_btn"):
             btn = getattr(self, button_name, None)
             if btn is None:
                 continue
-            if button_name == "run_btn":
-                set_cfg(btn, fg_color=palette["accent"], hover=True, hover_color=palette["accent_hover"], text_color=palette["accent_text"])
+            if button_name in ("run_btn", "key_review_confirm_btn"):
+                set_cfg(
+                    btn,
+                    fg_color=palette["accent"],
+                    hover=True,
+                    hover_color=palette["accent_hover"],
+                    text_color=palette["accent_text"],
+                )
             else:
-                set_cfg(btn, fg_color=palette["button"], hover=True, hover_color=palette["button_hover"], text_color=palette["button_text"])
+                set_cfg(
+                    btn,
+                    fg_color=palette["button"],
+                    hover=True,
+                    hover_color=palette["button_hover"],
+                    text_color=palette["button_text"],
+                )
 
-        for menu_name in ("appearance_menu", "citekey_rule_menu", "library_density_menu", "collection_menu"):
+        for menu_name in ("appearance_menu", "library_density_menu", "collection_menu"):
             menu = getattr(self, menu_name, None)
             set_cfg(menu, fg_color=palette["button"], button_color=palette["button_hover"], text_color=palette["button_text"])
 
@@ -429,6 +493,36 @@ class ModernBibGUI:
                 foreground=[("selected", palette["tree_sel_text"])],
             )
             set_cfg(self.library_tree, style=self._library_tree_style_name)
+
+        if hasattr(self, "key_review_tree"):
+            style = ttk.Style()
+            style.configure(
+                "KeyReview.Treeview",
+                background=palette["tree_bg"],
+                foreground=palette["text"],
+                fieldbackground=palette["tree_bg"],
+                rowheight=34,
+                borderwidth=0,
+                relief="flat",
+                font=("Segoe UI", 10),
+            )
+            style.configure(
+                "KeyReview.Treeview.Heading",
+                background=palette["tree_head"],
+                foreground=palette["text"],
+                relief="flat",
+                borderwidth=0,
+                font=("Segoe UI", 10, "bold"),
+            )
+            style.map(
+                "KeyReview.Treeview",
+                background=[("selected", palette["tree_sel"])],
+                foreground=[("selected", palette["tree_sel_text"])],
+            )
+            self.key_review_tree.configure(style="KeyReview.Treeview")
+            self.key_review_scrollbar.configure(
+                style="Vertical.TScrollbar",
+            )
 
         # Dynamic button groups keep their own active-state styling and must be refreshed after palette changes.
         try:
@@ -583,7 +677,12 @@ class ModernBibGUI:
             text="Bibliography Workspace",
             font=ctk.CTkFont(size=18, weight="bold")
         ).grid(row=0, column=0, sticky="w")
-        self.sidebar_brand_hint = ctk.CTkLabel(brand, text="Click left icons to open tools", font=ctk.CTkFont(size=11), text_color=palette["muted"])
+        self.sidebar_brand_hint = ctk.CTkLabel(
+            brand,
+            text="Click left icons to open tools",
+            font=ctk.CTkFont(size=11),
+            text_color=palette["muted"],
+        )
         self.sidebar_brand_hint.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         panel_host = ctk.CTkFrame(sidebar, fg_color="transparent")
@@ -653,6 +752,11 @@ class ModernBibGUI:
         )
         self.clear_btn.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=(0, 10))
 
+        self.batch_btn = ctk.CTkButton(
+            workspace_card, text="Process multiple projects", command=self._browse_batch_projects, height=30
+        )
+        self.batch_btn.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+
         options_card = ctk.CTkFrame(panel_host)
         options_card.grid(row=1, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
         self.options_card = options_card
@@ -665,11 +769,21 @@ class ModernBibGUI:
         row = ctk.CTkFrame(options_card, fg_color="transparent")
         row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 0))
         row.grid_columnconfigure(0, weight=1)
-        self.threshold_title_label = ctk.CTkLabel(row, text="Duplicate Similarity", font=ctk.CTkFont(size=11), text_color=palette["text"])
+        self.threshold_title_label = ctk.CTkLabel(
+            row,
+            text="Duplicate Similarity",
+            font=ctk.CTkFont(size=11),
+            text_color=palette["text"],
+        )
         self.threshold_title_label.grid(row=0, column=0, sticky="w")
 
         self.threshold_var = ctk.IntVar(value=85)
-        self.threshold_label = ctk.CTkLabel(row, text="85%", text_color=palette["accent"], font=ctk.CTkFont(size=11, weight="bold"))
+        self.threshold_label = ctk.CTkLabel(
+            row,
+            text="85%",
+            text_color=palette["accent"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
         self.threshold_label.grid(row=0, column=1, sticky="e")
 
         self.threshold_slider = ctk.CTkSlider(
@@ -685,12 +799,16 @@ class ModernBibGUI:
             options_card,
             text="Balanced (recommended)",
             font=ctk.CTkFont(size=10),
-            text_color="#7f8ba1"
+            text_color=palette["muted"]
         )
         self.threshold_hint.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 8))
 
         self.push_var = ctk.BooleanVar(value=True)
-        self.push_check = ctk.CTkCheckBox(options_card, text="Distribute master.bib to project folders", variable=self.push_var)
+        self.push_check = ctk.CTkCheckBox(
+            options_card,
+            text="Create processed copy beside source (originals unchanged)",
+            variable=self.push_var,
+        )
         self.push_check.grid(row=4, column=0, sticky="w", padx=12, pady=(0, 4))
 
         self.report_var = ctk.BooleanVar(value=True)
@@ -702,35 +820,19 @@ class ModernBibGUI:
         self.keys_card = keys_card
         keys_card.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(keys_card, text="Citation Key Policy", font=ctk.CTkFont(size=13, weight="bold")).grid(
+        ctk.CTkLabel(keys_card, text="Citation Key Format", font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=12, pady=(10, 6)
         )
 
-        self.citekey_rule_menu = ctk.CTkOptionMenu(
+        self.keys_description_label = ctk.CTkLabel(
             keys_card,
-            values=["author-year-title", "author-year-titleword", "author-title", "professor-style", "professor-strict", "author-et-al-year", "lastname-only-year", "firstauthor-year-titleword", "compact-initials", "numeric", "custom"],
-            variable=self.citekey_rule_var,
-            command=self._on_citekey_rule_changed,
-        )
-        self.citekey_rule_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
-        self.citekey_rule_menu.set("compact-initials")
-
-        self.citekey_custom_entry = ctk.CTkEntry(
-            keys_card,
-            textvariable=self.citekey_custom_var,
-            placeholder_text="Custom pattern, e.g. {author}{year}{titleword}",
-            state="disabled"
-        )
-        self.citekey_custom_entry.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
-
-        ctk.CTkLabel(
-            keys_card,
-            text="Default: every author's surname initial + year (SD2024); repeats use a, b, c... in source order. Tokens: {author}, {authorstem}, {authorstrict}, {authoretal}, {lastname}, {authorinitials}, {year}, {titleword}, {numeric}",
+            text="Uses each author's surname initial plus publication year (e.g., SD2024). Repeated keys get a, b, c... in source order.",
             wraplength=274,
             justify="left",
             text_color=palette["muted"],
             font=ctk.CTkFont(size=10),
-        ).grid(row=3, column=0, padx=12, pady=(0, 10), sticky="w")
+        )
+        self.keys_description_label.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="w")
 
         actions_card = ctk.CTkFrame(panel_host)
         actions_card.grid(row=3, column=0, sticky="ew", padx=(0, 14), pady=(0, 10))
@@ -750,7 +852,12 @@ class ModernBibGUI:
         self.appearance_card = appearance_card
         appearance_card.grid_columnconfigure(0, weight=1)
 
-        self.appearance_title_label = ctk.CTkLabel(appearance_card, text="Appearance", font=ctk.CTkFont(size=13, weight="bold"), text_color=palette["text"])
+        self.appearance_title_label = ctk.CTkLabel(
+            appearance_card,
+            text="Appearance",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=palette["text"],
+        )
         self.appearance_title_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
         self.appearance_menu = ctk.CTkOptionMenu(
             appearance_card,
@@ -824,7 +931,7 @@ class ModernBibGUI:
             header,
             text="Track pipeline progress, inspect duplicates, and verify fixes before export",
             font=ctk.CTkFont(size=11),
-            text_color=self._theme_palette(self._theme_mode)["muted"]
+            text_color=self._theme_palette(self._theme_mode)["muted"],
         )
         self.main_subtitle_label.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
@@ -844,7 +951,7 @@ class ModernBibGUI:
 
         self.run_btn = ctk.CTkButton(
             header_actions,
-            text="Clean and Normalize",
+            text="Analyze & Review",
             command=self._run_pipeline,
             height=36,
             width=156,
@@ -877,7 +984,7 @@ class ModernBibGUI:
 
         self.header_hint_label = ctk.CTkLabel(
             header,
-            text="Folder selection previews references. Use Clean and Normalize for full dedupe/key cleanup.",
+            text="Review real citation-key changes before creating the processed project copy.",
             font=ctk.CTkFont(size=10),
             text_color=self._theme_palette(self._theme_mode)["muted"],
         )
@@ -888,6 +995,7 @@ class ModernBibGUI:
         
         # Create tabs
         self.tabview.add("📚 Library")
+        self.tabview.add("🔑 Key Review")
         self.tabview.add("📋 Pipeline")
         self.tabview.add("📈 Dashboard")
         self.tabview.add("🔍 Duplicates")
@@ -896,6 +1004,7 @@ class ModernBibGUI:
         self.tabview.add("ℹ️ About")
         
         self._build_library_tab()
+        self._build_key_review_tab()
         self._build_pipeline_tab()
         self._build_results_tab()
         self._build_duplicates_tab()
@@ -928,6 +1037,223 @@ class ModernBibGUI:
 
         self._update_duplicates()
         self._pending_duplicates_refresh = False
+
+    def _build_key_review_tab(self):
+        """Build the confirmation step for the proposed citation-key changes."""
+        tab = self.tabview.tab("🔑 Key Review")
+        self.key_review_tab = tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(tab, corner_radius=10)
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        header.grid_columnconfigure(0, weight=1)
+        self.key_review_header = header
+
+        ctk.CTkLabel(
+            header,
+            text="Review citation keys",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 2))
+        self.key_review_project_label = ctk.CTkLabel(
+            header,
+            text="No project selected",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.key_review_project_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 0))
+        self.key_review_path_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+            justify="left",
+            wraplength=850,
+        )
+        self.key_review_path_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
+        self.key_review_status_label = ctk.CTkLabel(
+            header,
+            text="Analyze a project to see its real current and proposed keys here.",
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+            justify="left",
+            wraplength=850,
+        )
+        self.key_review_status_label.grid(row=3, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+
+        def resize_review_text(event):
+            wraplength = max(100, event.width - 32)
+            for label in (self.key_review_project_label, self.key_review_path_label, self.key_review_status_label):
+                label.configure(wraplength=wraplength)
+
+        header.bind("<Configure>", resize_review_text, add=True)
+
+        actions = ctk.CTkFrame(header, fg_color="transparent")
+        actions.grid(row=0, column=1, sticky="e", padx=16, pady=12)
+        self.key_review_confirm_btn = ctk.CTkButton(
+            actions,
+            text="Create processed copy",
+            command=self._approve_key_review,
+            state="disabled",
+            height=36,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.key_review_confirm_btn.grid(row=0, column=0, padx=(0, 8))
+        self.key_review_cancel_btn = ctk.CTkButton(
+            actions,
+            text="Cancel review",
+            command=self._cancel_key_review,
+            state="disabled",
+            height=36,
+        )
+        self.key_review_cancel_btn.grid(row=0, column=1)
+
+        table_frame = ctk.CTkFrame(tab, corner_radius=10)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(1, weight=1)
+        self.key_review_table_frame = table_frame
+
+        toolbar = ctk.CTkFrame(table_frame, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=12, pady=10)
+        toolbar.grid_columnconfigure(0, weight=1)
+        self.key_review_toolbar = toolbar
+        self.key_review_search_var = ctk.StringVar(value="")
+        self.key_review_search_var.trace_add("write", lambda *_args: self._filter_key_review())
+        self.key_review_search_entry = ctk.CTkEntry(
+            toolbar,
+            textvariable=self.key_review_search_var,
+            placeholder_text="Filter current or proposed keys...",
+            height=34,
+        )
+        self.key_review_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.key_review_count_label = ctk.CTkLabel(toolbar, text="0 changes", font=ctk.CTkFont(size=11))
+        self.key_review_count_label.grid(row=0, column=1, sticky="e")
+
+        tree_host = ctk.CTkFrame(table_frame, corner_radius=8)
+        tree_host.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        tree_host.grid_columnconfigure(0, weight=1)
+        tree_host.grid_rowconfigure(0, weight=1)
+        self.key_review_tree = ttk.Treeview(
+            tree_host,
+            columns=("current", "proposed"),
+            show="headings",
+            selectmode="browse",
+            style="KeyReview.Treeview",
+        )
+        self.key_review_tree.heading("current", text="CURRENT KEY")
+        self.key_review_tree.heading("proposed", text="PROPOSED KEY")
+        self.key_review_tree.column("current", width=360, minwidth=160, anchor="w")
+        self.key_review_tree.column("proposed", width=360, minwidth=160, anchor="w")
+        self.key_review_tree.grid(row=0, column=0, sticky="nsew")
+        self.key_review_scrollbar = ttk.Scrollbar(
+            tree_host,
+            orient="vertical",
+            command=self.key_review_tree.yview,
+        )
+        self.key_review_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.key_review_tree.configure(yscrollcommand=self.key_review_scrollbar.set)
+
+    def _filter_key_review(self):
+        """Render the review table using the current key filter."""
+        if not hasattr(self, "key_review_tree"):
+            return
+        query = self.key_review_search_var.get().strip().casefold()
+        self.key_review_tree.delete(*self.key_review_tree.get_children())
+        matches = [
+            (old_key, new_key)
+            for old_key, new_key in self._key_review_items
+            if not query or query in old_key.casefold() or query in new_key.casefold()
+        ]
+        for old_key, new_key in matches:
+            self.key_review_tree.insert("", "end", values=(old_key, new_key))
+        total = len(self._key_review_items)
+        self.key_review_count_label.configure(
+            text=f"{len(matches)} of {total} change{'s' if total != 1 else ''}"
+            if query else f"{total} change{'s' if total != 1 else ''}"
+        )
+
+    def _show_key_review(self):
+        """Show the generated mappings and wait for an explicit user decision."""
+        if not self.manager:
+            return
+        raw_mappings = self.manager.report_data.get("keys_changed", []) or []
+        self._key_review_items = [
+            (str(old_key), str(new_key))
+            for old_key, new_key in raw_mappings
+            if str(old_key) != str(new_key)
+        ]
+        self.key_review_search_var.set("")
+        self._filter_key_review()
+        mode = (
+            "The original project remains unchanged. Confirm to create a processed copy with these keys and updated citations."
+            if self._key_review_push_back
+            else "The original project remains unchanged. Confirm to create the master bibliography."
+        )
+        count = len(self._key_review_items)
+        project = self._batch_project or self._review_source
+        if project is not None:
+            project_path = Path(project)
+            progress = self._batch_progress
+            progress_text = f"  (project {progress[0]} of {progress[1]})" if progress else ""
+            self.key_review_project_label.configure(
+                text=f"Reviewing: {project_path.name or project_path.anchor}{progress_text}"
+            )
+            self.key_review_path_label.configure(text=f"Location: {project_path}")
+        else:
+            self.key_review_project_label.configure(text="No project selected")
+            self.key_review_path_label.configure(text="")
+        self.key_review_status_label.configure(
+            text=f"{count} citation key{'s' if count != 1 else ''} will change. {mode}"
+        )
+        self.key_review_confirm_btn.configure(
+            text="Create processed copy" if self._key_review_push_back else "Create master bibliography",
+            state="normal",
+        )
+        self.key_review_cancel_btn.configure(state="normal")
+        self.tabview.set("🔑 Key Review")
+
+    def _approve_key_review(self):
+        """Allow the worker to write the reviewed output."""
+        self._key_review_approved = True
+        if self._key_review_event is not None:
+            self._key_review_event.set()
+        self._pending_step_text = "Creating output from the reviewed mappings..."
+        self._pending_step_color = "#3b8ed0"
+        self._apply_pipeline_snapshot()
+        self.key_review_confirm_btn.configure(state="disabled", text="Creating output...")
+        self.key_review_cancel_btn.configure(state="disabled")
+        self.key_review_status_label.configure(text="Creating the output from the reviewed mappings...")
+
+    def _complete_key_review(self, creates_copy: bool):
+        """Mark the confirmed output as ready after the pipeline finishes."""
+        self.key_review_confirm_btn.configure(state="disabled", text="Output created")
+        self.key_review_status_label.configure(
+            text=(
+                "Processed project copy is ready. The original project remains unchanged."
+                if creates_copy
+                else "Master bibliography is ready. The source project remains unchanged."
+            )
+        )
+
+    def _cancel_key_review(self):
+        """Cancel the paused pipeline before it creates any output."""
+        self._key_review_approved = False
+        self.processing = False
+        if self._key_review_event is not None:
+            self._key_review_event.set()
+        self.key_review_confirm_btn.configure(state="disabled", text="Review cancelled")
+        self.key_review_cancel_btn.configure(state="disabled")
+        message = (
+            "Batch cancelled. Earlier processed copies remain available."
+            if getattr(self, "_batch_project", None)
+            else "Review cancelled. No processed output was created."
+        )
+        self.key_review_status_label.configure(text=message)
+        self._log_message(message)
+        self._set_status("Cancelled", "#f59e0b")
 
     def _build_library_tab(self):
         """Build a reference-manager style three-pane library workspace."""
@@ -1012,7 +1338,7 @@ class ModernBibGUI:
 
         self.library_left_tip_label = ctk.CTkLabel(
             left,
-            text="Tip: choose a folder to preview references instantly.",
+            text="Choose a scope or create collections for this session.",
             text_color=text_secondary,
             font=ctk.CTkFont(size=10),
             wraplength=180,
@@ -1271,50 +1597,107 @@ class ModernBibGUI:
         right = ctk.CTkFrame(tab, fg_color=pane_right_bg)
         right.grid(row=0, column=2, sticky="nsew", padx=(0, 10), pady=10)
         self.library_right_frame = right
-        right.grid_rowconfigure(2, weight=1)
+        right.grid_rowconfigure(3, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(right, text="Details", text_color=text_primary, font=ctk.CTkFont(size=15, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(10, 8)
+        ctk.CTkLabel(right, text="Selected Reference", text_color=text_primary, font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 4)
         )
 
+        selected_summary = ctk.CTkFrame(right, fg_color="transparent")
+        selected_summary.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        selected_summary.grid_columnconfigure(0, weight=1)
+        self.library_selected_title = ctk.CTkLabel(
+            selected_summary,
+            text="No reference selected",
+            text_color=text_primary,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+            justify="left",
+            wraplength=220,
+        )
+        self.library_selected_title.grid(row=0, column=0, sticky="ew")
+        self.library_selected_key = ctk.CTkLabel(
+            selected_summary,
+            text="Select a row in the table to inspect it and enable actions.",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=10),
+            anchor="w",
+            justify="left",
+            wraplength=220,
+        )
+        self.library_selected_key.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+
         detail_actions = ctk.CTkFrame(right, fg_color="transparent")
-        detail_actions.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        detail_actions.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
         self.library_detail_actions = detail_actions
         detail_actions.grid_columnconfigure(0, weight=1)
 
         self.copy_key_btn = ctk.CTkButton(
             detail_actions,
-            text="Copy Key",
+            text="Copy citation key",
             height=control_h,
             fg_color=neutral_btn,
             hover=False,
             command=self._copy_selected_key,
+            state="disabled",
         )
-        self.copy_key_btn.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.copy_key_btn.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        ctk.CTkLabel(
+            detail_actions,
+            text="Collection destination",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 3))
+        self.library_action_collection_var = ctk.StringVar(value="Create a collection first")
+        self.library_action_collection_menu = ctk.CTkOptionMenu(
+            detail_actions,
+            variable=self.library_action_collection_var,
+            values=["Create a collection first"],
+            height=control_h,
+            fg_color=neutral_btn,
+            button_color=neutral_btn_hover,
+            state="disabled",
+            command=self._on_action_collection_selected,
+        )
+        self.library_action_collection_menu.grid(row=2, column=0, sticky="ew", pady=(0, 4))
 
         self.add_selected_btn = ctk.CTkButton(
             detail_actions,
-            text="Add to Collection",
+            text="Add selected reference",
             height=control_h,
             fg_color=neutral_btn,
             hover=False,
-            command=self._add_selected_to_active_collection,
+            command=self._add_selected_to_chosen_collection,
+            state="disabled",
         )
-        self.add_selected_btn.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.add_selected_btn.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        self.library_action_hint = ctk.CTkLabel(
+            detail_actions,
+            text="Create a collection from the Collections icon on the left.",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=9),
+            anchor="w",
+            justify="left",
+            wraplength=220,
+        )
+        self.library_action_hint.grid(row=4, column=0, sticky="ew", pady=(0, 6))
 
         self.review_duplicate_btn = ctk.CTkButton(
             detail_actions,
-            text="Review Duplicates",
+            text="Find duplicate group",
             height=control_h,
             fg_color=neutral_btn,
             hover=False,
             command=self._review_selected_duplicates,
+            state="disabled",
         )
-        self.review_duplicate_btn.grid(row=2, column=0, sticky="ew")
+        self.review_duplicate_btn.grid(row=5, column=0, sticky="ew")
 
         self.library_details_tabs = ctk.CTkTabview(right)
-        self.library_details_tabs.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.library_details_tabs.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.library_details_tabs.add("Info")
         self.library_details_tabs.add("Notes")
         self.library_details_tabs.add("Tags")
@@ -1325,7 +1708,8 @@ class ModernBibGUI:
         info_tab.grid_columnconfigure(0, weight=1)
         self.library_info_text = ctk.CTkTextbox(info_tab, font=ctk.CTkFont(family="Segoe UI", size=11), wrap="word")
         self.library_info_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.library_info_text.insert("1.0", "Choose a folder, then select a reference to view metadata.")
+        self.library_info_text.insert("1.0", "Select a reference in the table to inspect its BibTeX fields.")
+        self.library_info_text.configure(state="disabled")
 
         edit_box = ctk.CTkFrame(info_tab, fg_color=card_bg)
         edit_box.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
@@ -1333,48 +1717,104 @@ class ModernBibGUI:
         for col in range(2):
             edit_box.grid_columnconfigure(col, weight=1)
 
+        self.metadata_session_hint = ctk.CTkLabel(
+            edit_box,
+            text="Session only · changes are not written to the source .bib file.",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=9),
+            anchor="w",
+            justify="left",
+            wraplength=220,
+        )
+        self.metadata_session_hint.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))
         self.meta_author_var = ctk.StringVar(value="")
         self.meta_year_var = ctk.StringVar(value="")
         self.meta_title_var = ctk.StringVar(value="")
         self.meta_source_var = ctk.StringVar(value="")
         self.meta_doi_var = ctk.StringVar(value="")
 
-        ctk.CTkLabel(edit_box, text="Author", font=ctk.CTkFont(size=10)).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
-        ctk.CTkLabel(edit_box, text="Year", font=ctk.CTkFont(size=10)).grid(row=0, column=1, sticky="w", padx=6, pady=(6, 0))
+        ctk.CTkLabel(edit_box, text="Author", font=ctk.CTkFont(size=10)).grid(row=1, column=0, sticky="w", padx=6, pady=(4, 0))
+        ctk.CTkLabel(edit_box, text="Year", font=ctk.CTkFont(size=10)).grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
         self.meta_author_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_author_var, height=control_h)
-        self.meta_author_entry.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_author_entry.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
         self.meta_year_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_year_var, height=control_h)
-        self.meta_year_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_year_entry.grid(row=2, column=1, sticky="ew", padx=6, pady=(0, 4))
 
-        ctk.CTkLabel(edit_box, text="Source", font=ctk.CTkFont(size=10)).grid(row=2, column=0, sticky="w", padx=6, pady=(0, 0))
-        ctk.CTkLabel(edit_box, text="DOI", font=ctk.CTkFont(size=10)).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 0))
+        ctk.CTkLabel(edit_box, text="Source", font=ctk.CTkFont(size=10)).grid(row=3, column=0, sticky="w", padx=6, pady=(0, 0))
+        ctk.CTkLabel(edit_box, text="DOI", font=ctk.CTkFont(size=10)).grid(row=3, column=1, sticky="w", padx=6, pady=(0, 0))
         self.meta_source_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_source_var, height=control_h)
-        self.meta_source_entry.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_source_entry.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
         self.meta_doi_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_doi_var, height=control_h)
-        self.meta_doi_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=(0, 4))
+        self.meta_doi_entry.grid(row=4, column=1, sticky="ew", padx=6, pady=(0, 4))
 
-        ctk.CTkLabel(edit_box, text="Title", font=ctk.CTkFont(size=10)).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 0))
+        ctk.CTkLabel(edit_box, text="Title", font=ctk.CTkFont(size=10)).grid(row=5, column=0, sticky="w", padx=6, pady=(0, 0))
         self.meta_title_entry = ctk.CTkEntry(edit_box, textvariable=self.meta_title_var, height=control_h)
-        self.meta_title_entry.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        self.meta_save_btn = ctk.CTkButton(edit_box, text="Save Metadata", height=control_h, command=self._save_selected_metadata)
-        self.meta_save_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.meta_title_entry.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.meta_save_btn = ctk.CTkButton(
+            edit_box,
+            text="Save for this session",
+            height=control_h,
+            command=self._save_selected_metadata,
+            state="disabled",
+        )
+        self.meta_save_btn.grid(row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        for entry_widget in (
+            self.meta_author_entry,
+            self.meta_year_entry,
+            self.meta_source_entry,
+            self.meta_doi_entry,
+            self.meta_title_entry,
+        ):
+            entry_widget.configure(state="disabled")
 
         notes_tab = self.library_details_tabs.tab("Notes")
-        notes_tab.grid_rowconfigure(0, weight=1)
+        notes_tab.grid_rowconfigure(1, weight=1)
         notes_tab.grid_columnconfigure(0, weight=1)
+        self.notes_session_hint = ctk.CTkLabel(
+            notes_tab,
+            text="Notes are kept in this session only.",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=9),
+            anchor="w",
+        )
+        self.notes_session_hint.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
         self.library_notes_text = ctk.CTkTextbox(notes_tab, font=ctk.CTkFont(size=11), wrap="word")
-        self.library_notes_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
-        self.library_note_save_btn = ctk.CTkButton(notes_tab, text="Save Note", height=control_h, command=self._save_selected_note)
-        self.library_note_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
+        self.library_notes_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 4))
+        self.library_notes_text.configure(state="disabled")
+        self.library_note_save_btn = ctk.CTkButton(
+            notes_tab,
+            text="Save note for this session",
+            height=control_h,
+            command=self._save_selected_note,
+            state="disabled",
+        )
+        self.library_note_save_btn.grid(row=2, column=0, sticky="e", padx=6, pady=(0, 6))
 
         tags_tab = self.library_details_tabs.tab("Tags")
-        tags_tab.grid_rowconfigure(0, weight=1)
+        tags_tab.grid_rowconfigure(1, weight=1)
         tags_tab.grid_columnconfigure(0, weight=1)
+        self.tags_session_hint = ctk.CTkLabel(
+            tags_tab,
+            text="Tags are kept in this session only.",
+            text_color=text_secondary,
+            font=ctk.CTkFont(size=9),
+            anchor="w",
+        )
+        self.tags_session_hint.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
         self.library_tags_text = ctk.CTkTextbox(tags_tab, font=ctk.CTkFont(size=11), wrap="word")
-        self.library_tags_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 4))
-        self.library_tag_save_btn = ctk.CTkButton(tags_tab, text="Save Tags", height=control_h, command=self._save_selected_tags)
-        self.library_tag_save_btn.grid(row=1, column=0, sticky="e", padx=6, pady=(0, 6))
+        self.library_tags_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 4))
+        self.library_tags_text.configure(state="disabled")
+        self.library_tag_save_btn = ctk.CTkButton(
+            tags_tab,
+            text="Save tags for this session",
+            height=control_h,
+            command=self._save_selected_tags,
+            state="disabled",
+        )
+        self.library_tag_save_btn.grid(row=2, column=0, sticky="e", padx=6, pady=(0, 6))
 
+        self._refresh_action_collection_menu([])
+        self._clear_library_selection()
         self._update_library_scope_buttons()
 
     def _set_library_left_mode(self, mode: Optional[str], force_open: bool = False):
@@ -1476,11 +1916,43 @@ class ModernBibGUI:
         if not names:
             self.collection_menu.configure(values=["No collections"])
             self.collection_menu.set("No collections")
+            self._refresh_action_collection_menu(names)
             return
         self.collection_menu.configure(values=names)
         current = self._active_collection_name if self._active_collection_name in names else names[0]
         self._active_collection_name = current
         self.collection_menu.set(current)
+        self._refresh_action_collection_menu(names)
+
+    def _refresh_action_collection_menu(self, names=None):
+        """Keep the Details panel's collection destination in sync with collections."""
+        if not hasattr(self, 'library_action_collection_menu'):
+            return
+        collection_names = sorted(self._custom_collections) if names is None else names
+        if not collection_names:
+            self._selected_action_collection = None
+            self.library_action_collection_var.set("Create a collection first")
+            self.library_action_collection_menu.configure(
+                values=["Create a collection first"],
+                state="disabled",
+            )
+        else:
+            selected = self._selected_action_collection
+            if selected is None or selected not in collection_names:
+                active = self._active_collection_name
+                selected = active if active is not None and active in collection_names else collection_names[0]
+            self._selected_action_collection = selected
+            self.library_action_collection_menu.configure(
+                values=collection_names,
+                state="normal",
+            )
+            self.library_action_collection_var.set(selected)
+        self._update_library_selection_actions(self._selected_library_entry)
+
+    def _on_action_collection_selected(self, selection: str):
+        if selection in self._custom_collections:
+            self._selected_action_collection = selection
+            self._update_library_selection_actions(self._selected_library_entry)
 
     def _add_collection(self):
         name = (self.collection_name_var.get() if hasattr(self, 'collection_name_var') else "").strip()
@@ -1489,9 +1961,11 @@ class ModernBibGUI:
         if name not in self._custom_collections:
             self._custom_collections[name] = set()
         self._active_collection_name = name
+        self._selected_action_collection = name
         self._set_library_left_mode("collections", force_open=True)
         self._refresh_collection_menu()
         self.collection_name_var.set("")
+        self._update_library_selection_actions(self._selected_library_entry)
 
     def _on_collection_selected(self, selection: str):
         if selection == "No collections":
@@ -1500,6 +1974,8 @@ class ModernBibGUI:
             return
         if selection in self._custom_collections:
             self._active_collection_name = selection
+            self._selected_action_collection = selection
+            self._refresh_action_collection_menu()
             self._library_scope = "Collection"
             self._set_library_left_mode("collections", force_open=True)
             self._update_library_scope_buttons()
@@ -1539,6 +2015,100 @@ class ModernBibGUI:
         self._custom_collections[self._active_collection_name].add(key)
         if self._library_scope == "Collection":
             self._apply_library_filter()
+
+    def _add_selected_to_chosen_collection(self):
+        entry = self._get_selected_library_entry()
+        collection_name = self._selected_action_collection
+        if not entry:
+            self._set_status("Select a reference before adding it to a collection.", "#f59e0b")
+            return
+        if collection_name not in self._custom_collections:
+            self._set_library_left_mode("collections", force_open=True)
+            self._set_status("Create a collection in the left Collections panel first.", "#f59e0b")
+            return
+        key = str(entry.get('ID', '')).strip()
+        if not key:
+            self._set_status("The selected reference has no citation key.", "#f59e0b")
+            return
+        self._custom_collections[collection_name].add(key)
+        self._set_status(f"Added {key} to {collection_name} (this session only).", "#22c55e")
+        if self._library_scope == "Collection" and collection_name == self._active_collection_name:
+            self._apply_library_filter()
+
+    def _update_library_selection_actions(self, entry):
+        """Reflect selection and collection availability in the inspector controls."""
+        has_selection = entry is not None
+        has_collections = bool(self._custom_collections)
+        if not hasattr(self, 'copy_key_btn'):
+            return
+
+        selection_state = "normal" if has_selection else "disabled"
+        for button in (
+            self.copy_key_btn,
+            self.meta_save_btn,
+            self.library_note_save_btn,
+            self.library_tag_save_btn,
+        ):
+            button.configure(state=selection_state)
+        self.review_duplicate_btn.configure(
+            state="normal" if has_selection and self.manager is not None else "disabled"
+        )
+        self.add_selected_btn.configure(
+            state="normal" if has_selection and has_collections else "disabled"
+        )
+        self.add_to_collection_btn.configure(
+            state=(
+                "normal"
+                if has_selection and self._active_collection_name in self._custom_collections
+                else "disabled"
+            )
+        )
+        self.remove_collection_btn.configure(
+            state="normal" if self._active_collection_name in self._custom_collections else "disabled"
+        )
+        input_state = "normal" if has_selection else "disabled"
+        for entry_name in (
+            "meta_author_entry",
+            "meta_year_entry",
+            "meta_source_entry",
+            "meta_doi_entry",
+            "meta_title_entry",
+        ):
+            getattr(self, entry_name).configure(state=input_state)
+        for textbox_name in ("library_notes_text", "library_tags_text"):
+            getattr(self, textbox_name).configure(state=input_state)
+        self.library_action_collection_menu.configure(
+            state="normal" if has_collections else "disabled"
+        )
+
+        if not has_selection:
+            self.library_selected_title.configure(text="No reference selected")
+            self.library_selected_key.configure(
+                text="Select a row in the table to inspect it and enable actions."
+            )
+            self.library_action_hint.configure(
+                text=(
+                    "Create a collection from the Collections icon on the left."
+                    if not has_collections
+                    else "Select a reference, choose a destination, then add it."
+                )
+            )
+            return
+
+        title = str(entry.get("title", "")).strip() or "Untitled reference"
+        key = str(entry.get("ID", "")).strip() or "No citation key"
+        self.library_selected_title.configure(text=title)
+        self.library_selected_key.configure(text=f"Citation key: {key}")
+        if has_collections:
+            self.add_selected_btn.configure(text="Add to selected collection")
+            self.library_action_hint.configure(
+                text=f"Adds this reference to “{self._selected_action_collection}”. Collections are session-only."
+            )
+        else:
+            self.add_selected_btn.configure(text="Add selected reference")
+            self.library_action_hint.configure(
+                text="Create a collection from the Collections icon on the left, then choose it here."
+            )
 
     def _change_library_density(self, mode: str):
         """Switch table row density between compact and comfortable."""
@@ -1662,7 +2232,10 @@ class ModernBibGUI:
 
     def _review_selected_duplicates(self):
         entry = self._get_selected_library_entry()
-        if not entry or not self.manager:
+        if not entry:
+            return
+        if not self.manager:
+            self._set_status("Load a project before reviewing duplicate groups.", "#f59e0b")
             return
         key = str(entry.get('ID', '')).strip()
         if not key:
@@ -1810,6 +2383,7 @@ class ModernBibGUI:
                     str(e.get('title', '')),
                     str(e.get('year', '')),
                     str(e.get('journal', '')),
+                    str(e.get('note', '')),
                 ]).lower()
                 return query in blob
             entries = [e for e in entries if _match(e)]
@@ -1827,6 +2401,7 @@ class ModernBibGUI:
     def _refresh_library_tree(self):
         if not hasattr(self, 'library_tree'):
             return
+        selected_key = self._selected_library_key
 
         if hasattr(self, 'library_count_badge'):
             shown = len(self._library_filtered_entries)
@@ -1858,10 +2433,68 @@ class ModernBibGUI:
             status = " ".join(markers)
             author = str(entry.get('author', 'Unknown')).replace('{', '').replace('}', '')
             year = str(entry.get('year', ''))
-            title = str(entry.get('title', 'No title')).replace('{', '').replace('}', '')
+            title = str(entry.get('title') or (
+                " ".join(str(entry.get('note', '')).split()) if entry.get('_manual_bibitem') else 'No title'
+            )).replace('{', '').replace('}', '')
             source = str(entry.get('journal') or entry.get('booktitle') or entry.get('_source_file_display') or '')
             key = str(entry.get('ID', ''))
             self.library_tree.insert('', 'end', iid=str(idx), values=(status, author, year, title, source, key))
+
+        selected_index = next(
+            (
+                idx for idx, entry in enumerate(self._library_filtered_entries)
+                if selected_key and str(entry.get("ID", "")).strip() == selected_key
+            ),
+            None,
+        )
+        if selected_index is None:
+            self.library_tree.selection_remove(self.library_tree.selection())
+            self._clear_library_selection()
+        else:
+            selected_id = str(selected_index)
+            self.library_tree.selection_set(selected_id)
+            self.library_tree.focus(selected_id)
+            self._on_library_row_selected()
+
+    def _clear_library_selection(self):
+        """Reset the inspector to an explicit empty-selection state."""
+        self._selected_library_entry = None
+        self._selected_library_key = ""
+        if hasattr(self, "library_info_text"):
+            self.library_info_text.configure(state="normal")
+            self.library_info_text.delete("1.0", "end")
+            self.library_info_text.insert(
+                "1.0",
+                "Select a reference in the table to inspect its BibTeX fields. Metadata edits are session-only and are not written to the source .bib file.",
+            )
+            self.library_info_text.configure(state="disabled")
+        for variable_name in (
+            "meta_author_var",
+            "meta_year_var",
+            "meta_title_var",
+            "meta_source_var",
+            "meta_doi_var",
+        ):
+            variable = getattr(self, variable_name, None)
+            if variable is not None:
+                variable.set("")
+        for textbox_name in ("library_notes_text", "library_tags_text"):
+            textbox = getattr(self, textbox_name, None)
+            if textbox is not None:
+                textbox.configure(state="normal")
+                textbox.delete("1.0", "end")
+                textbox.configure(state="disabled")
+        for entry_name in (
+            "meta_author_entry",
+            "meta_year_entry",
+            "meta_source_entry",
+            "meta_doi_entry",
+            "meta_title_entry",
+        ):
+            entry_widget = getattr(self, entry_name, None)
+            if entry_widget is not None:
+                entry_widget.configure(state="disabled")
+        self._update_library_selection_actions(None)
 
     def _sort_library_tree(self, column: str, numeric: bool):
         if not hasattr(self, 'library_tree'):
@@ -1879,12 +2512,15 @@ class ModernBibGUI:
             return
         selected = self.library_tree.selection()
         if not selected:
+            self._clear_library_selection()
             return
         try:
             idx = int(selected[0])
         except Exception:
+            self._clear_library_selection()
             return
         if idx < 0 or idx >= len(self._library_filtered_entries):
+            self._clear_library_selection()
             return
         entry = self._library_filtered_entries[idx]
         self._selected_library_entry = entry
@@ -1908,8 +2544,19 @@ class ModernBibGUI:
             details.append(f"{k}: {entry.get(k, '')}")
 
         if hasattr(self, 'library_info_text'):
+            self.library_info_text.configure(state="normal")
             self.library_info_text.delete("1.0", "end")
             self.library_info_text.insert("1.0", "\n".join(details))
+            self.library_info_text.configure(state="disabled")
+
+        for entry_name in (
+            "meta_author_entry",
+            "meta_year_entry",
+            "meta_source_entry",
+            "meta_doi_entry",
+            "meta_title_entry",
+        ):
+            getattr(self, entry_name).configure(state="normal")
 
         if hasattr(self, 'meta_author_var'):
             self.meta_author_var.set(str(entry.get('author', '')))
@@ -1924,13 +2571,16 @@ class ModernBibGUI:
 
         if hasattr(self, 'library_notes_text'):
             note = self._library_notes.get(self._selected_library_key, "")
+            self.library_notes_text.configure(state="normal")
             self.library_notes_text.delete("1.0", "end")
             self.library_notes_text.insert("1.0", note)
 
         if hasattr(self, 'library_tags_text'):
             tags = self._library_tags.get(self._selected_library_key, "")
+            self.library_tags_text.configure(state="normal")
             self.library_tags_text.delete("1.0", "end")
             self.library_tags_text.insert("1.0", tags)
+        self._update_library_selection_actions(entry)
         
     def _build_pipeline_tab(self):
         """Build pipeline execution tab with step cards"""
@@ -2273,13 +2923,27 @@ class ModernBibGUI:
         self.documents_controls = controls
         controls.grid_columnconfigure(1, weight=1)
 
+        self.document_project_frame = ctk.CTkFrame(controls, fg_color="transparent")
+        self.document_project_frame.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 6))
+        ctk.CTkLabel(self.document_project_frame, text="Project:", anchor="w").pack(side="left", padx=(0, 8))
+        self.document_project_menu = ctk.CTkOptionMenu(
+            self.document_project_frame,
+            values=["No batch projects"],
+            command=self._select_batch_document_project,
+            state="disabled",
+            width=260,
+        )
+        self.document_project_menu.pack(side="left", fill="x", expand=True)
+        self.document_project_menu.set("No batch projects")
+        self.document_project_frame.grid_remove()
+
         self.document_file_menu = ctk.CTkOptionMenu(
             controls,
             values=["Run the pipeline to load .tex files"],
             command=self._show_tex_document,
             state="disabled",
         )
-        self.document_file_menu.grid(row=0, column=0, padx=(0, 10), sticky="w")
+        self.document_file_menu.grid(row=1, column=0, padx=(0, 10), sticky="w")
         self.document_file_menu.set("Run the pipeline to load .tex files")
 
         self.document_info = ctk.CTkLabel(
@@ -2288,7 +2952,7 @@ class ModernBibGUI:
             text_color="gray",
             anchor="w",
         )
-        self.document_info.grid(row=0, column=1, sticky="ew")
+        self.document_info.grid(row=1, column=1, sticky="ew")
 
         self.document_previous_button = ctk.CTkButton(
             controls,
@@ -2297,7 +2961,7 @@ class ModernBibGUI:
             command=lambda: self._navigate_tex_citation(-1),
             state="disabled",
         )
-        self.document_previous_button.grid(row=0, column=2, padx=(8, 4))
+        self.document_previous_button.grid(row=1, column=2, padx=(8, 4))
 
         self.document_next_button = ctk.CTkButton(
             controls,
@@ -2306,7 +2970,7 @@ class ModernBibGUI:
             command=lambda: self._navigate_tex_citation(1),
             state="disabled",
         )
-        self.document_next_button.grid(row=0, column=3, padx=(4, 8))
+        self.document_next_button.grid(row=1, column=3, padx=(4, 8))
 
         self.document_citation_count = ctk.CTkLabel(
             controls,
@@ -2314,7 +2978,7 @@ class ModernBibGUI:
             width=54,
             anchor="e",
         )
-        self.document_citation_count.grid(row=0, column=4, sticky="e")
+        self.document_citation_count.grid(row=1, column=4, sticky="e")
 
         self.document_text = ctk.CTkTextbox(
             tab,
@@ -2335,12 +2999,12 @@ class ModernBibGUI:
         self.document_text.insert("1.0", content)
         self._highlight_tex_citations(content)
         self.document_text.configure(state="disabled")
-        report_data = self.manager.report_data if self.manager else {}
-        if report_data.get("push_back"):
+        report_data = self._document_report_data
+        if report_data.get("processed_copy_path"):
             citation_count = report_data.get("tex_citation_updates", 0)
             file_count = report_data.get("tex_files_updated", 0)
             self.document_info.configure(
-                text=f"{selection} · updated source project · {citation_count} citation(s) updated across {file_count} .tex file(s)"
+                text=f"{selection} · processed copy · {citation_count} citation(s) updated across {file_count} .tex file(s)"
             )
         else:
             self.document_info.configure(text=f"{selection} · source file (unchanged)")
@@ -2398,9 +3062,11 @@ class ModernBibGUI:
         current = self._current_tex_citation_idx + 1 if has_citations else 0
         self.document_citation_count.configure(text=f"{current} of {citation_count}")
 
-    def _load_tex_documents(self):
+    def _load_tex_documents(self, report_data=None):
         """Populate the document picker from the completed pipeline result."""
-        report_data = self.manager.report_data if self.manager else {}
+        if report_data is None:
+            report_data = self.manager.report_data if self.manager else {}
+        self._document_report_data = report_data
         documents = report_data.get("tex_documents", {})
         self._tex_documents = documents if isinstance(documents, dict) else {}
 
@@ -2430,24 +3096,61 @@ class ModernBibGUI:
         self.document_file_menu.configure(values=file_names, state="normal")
         self.document_file_menu.set(file_names[0])
 
-        if report_data.get("push_back"):
+        if report_data.get("processed_copy_path"):
             citation_count = report_data.get("tex_citation_updates", 0)
             file_count = report_data.get("tex_files_updated", 0)
             self.document_info.configure(
-                text=f"Updated source preview · {citation_count} citation(s) updated in {file_count} .tex file(s); original source files unchanged."
+                text=f"Processed copy preview · {citation_count} citation(s) updated in {file_count} .tex file(s); originals unchanged."
             )
         else:
             self.document_info.configure(
-                text="Showing source files. The update option was off, so citation keys in source files were not rewritten."
+                text="Showing source files. The processed-copy option was off, so their citation keys were not rewritten."
             )
 
         self._show_tex_document(file_names[0])
 
+    def _load_batch_documents(self, results: list[dict]):
+        """Make completed processed copies available in the document viewer."""
+        self._batch_document_projects = {
+            str(result["project"]): (Path(result["output"]), result["manager"].report_data)
+            for result in results if "output" in result and "manager" in result
+        }
+        projects = list(self._batch_document_projects)
+        if not projects:
+            self.document_project_frame.grid_remove()
+            self._reset_tex_document_view("No processed projects")
+            self.document_info.configure(text="No processed project copies are available to preview.")
+            return
+        self.document_project_menu.configure(values=projects, state="normal")
+        self.document_project_frame.grid()
+        self.document_project_menu.set(projects[0])
+        self._select_batch_document_project(projects[0])
+
+    def _select_batch_document_project(self, selection: str):
+        project = self._batch_document_projects.get(selection)
+        if project is None:
+            self._log_message(f"⚠️ Unknown project selected for document preview: {selection}")
+            return
+        output, original_report = project
+        report = dict(original_report)
+        try:
+            if not output.is_dir():
+                raise FileNotFoundError(f"Processed project folder not found: {output}")
+            report["tex_documents"] = _collect_tex_documents(output)
+            report.pop("tex_preview_error", None)
+        except (OSError, UnicodeError) as error:
+            report["tex_preview_error"] = f"Could not load LaTeX documents from {output}: {error}"
+            self._log_message(f"⚠️ {report['tex_preview_error']}")
+        self._load_tex_documents(report)
+
     def _reset_tex_document_view(self, message: str):
         """Clear any stale document preview before another pipeline run."""
         self._tex_documents = {}
+        self._document_report_data = {}
+        self._batch_document_projects = {}
         if not hasattr(self, "document_text"):
             return
+        self.document_project_frame.grid_remove()
         self.document_text.configure(state="normal")
         self.document_text.delete("1.0", "end")
         self._tex_citation_spans = []
@@ -2827,25 +3530,12 @@ class ModernBibGUI:
         • Author name matching (30% weight)
         • Year bonus (+10%)
         
-                Citation Key Normalization:
-                The manager regenerates keys into a consistent, informative format:
-                firstauthor[-secondauthor]-year-titleword1[-titleword2]
-
-                Examples:
-                • smith-2023-advances-ai
-                • chen-zhang-2021-machine-learning
-
-                Rules:
-                • Uses up to first 2 author surnames
-                • Uses a 4-digit year when available
-                • Uses up to first 2 meaningful title words
-                • Ensures uniqueness with suffixes when needed
-                    (e.g., smith-2023-advances-ai-a)
-
-                Why it helps:
-                • Keys become predictable and readable
-                • Easier to cite and search across files
-                • Better consistency after merging bibliographies
+        Citation Key Normalization:
+        • Uses each author's surname initial plus publication year (Smith and Doe, 2024 → SD2024)
+        • Repeated author/year keys receive a, b, c... suffixes in source order
+        • Uses 0000 when the publication year is missing
+        • Writes updated .bib and .tex files into a processed project copy
+        • Leaves the original project files unchanged
         
         ══════════════════════════════════════════
         Final Year Project 2026
@@ -2882,18 +3572,44 @@ class ModernBibGUI:
         """Quick-fill test_data directory for demos."""
         candidate = Path(self.root.winfo_toplevel().tk.call('pwd')) / "test_data"
         if candidate.exists():
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, str(candidate))
             self._log_message(f"ℹ️ Using demo folder: {candidate}")
-            self._load_library_preview_from_source(str(candidate))
+            self._select_project_source(str(candidate))
         else:
             self._log_message("⚠️ test_data folder not found in current project")
+
+    def _restore_last_source(self):
+        try:
+            source_path = _load_last_source()
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            self._log_message(f"⚠️ Could not load the saved project path: {error}")
+            return
+        if not source_path:
+            return
+        if not Path(source_path).exists():
+            self._log_message(f"ℹ️ The last project path is unavailable: {source_path}")
+            return
+        self._select_project_source(source_path)
+        self._log_message(f"ℹ️ Restored last project: {source_path}")
+
+    def _select_project_source(self, source_path: str):
+        selected_path = str(Path(source_path).expanduser().resolve())
+        self.dir_entry.delete(0, "end")
+        self.dir_entry.insert(0, selected_path)
+        self._clear_library_selection()
+        try:
+            _save_last_source(selected_path)
+        except OSError as error:
+            self._log_message(f"⚠️ Could not save the project path: {error}")
+        self._load_library_preview_from_source(selected_path)
 
     def _clear_for_next_run(self):
         """Clear logs/results quickly for a fresh demo run."""
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
         self.results_text.insert("1.0", "Run the pipeline to see a summary of what changed.")
+        self.key_review_project_label.configure(text="No project selected")
+        self.key_review_path_label.configure(text="")
+        self.key_review_status_label.configure(text="Analyze a project to see its real current and proposed keys here.")
         if hasattr(self, 'results_files_box'):
             self.results_files_box.delete("1.0", "end")
             self.results_files_box.insert("1.0", "Changed files will appear here after a run.")
@@ -2903,6 +3619,17 @@ class ModernBibGUI:
         if hasattr(self, 'fixes_diff_text'):
             self.fixes_diff_text.delete("1.0", "end")
         self._reset_tex_document_view("Run the pipeline to load .tex files")
+        if hasattr(self, 'document_text'):
+            self.document_text.configure(state="normal")
+            self.document_text.delete("1.0", "end")
+            self.document_text.configure(state="disabled")
+            self.document_file_menu.configure(
+                values=["Run the pipeline to load .tex files"],
+                state="disabled",
+            )
+            self.document_file_menu.set("Run the pipeline to load .tex files")
+            self.document_info.configure(text="Choose a LaTeX file to inspect citation keys.")
+        self._tex_documents = {}
         self.changed_info.configure(text="")
         self._current_changed_lines = []
         self._current_changed_display_lines = []
@@ -2911,41 +3638,29 @@ class ModernBibGUI:
         self.next_change_btn.configure(state="disabled")
         self._library_entries = []
         self._library_filtered_entries = []
-        self._selected_library_key = ""
-        self._selected_library_entry = None
-        if hasattr(self, 'library_info_text'):
-            self.library_info_text.delete("1.0", "end")
-            self.library_info_text.insert("1.0", "Choose a folder, then select a reference to view metadata.")
-        if hasattr(self, 'meta_author_var'):
-            self.meta_author_var.set("")
-        if hasattr(self, 'meta_year_var'):
-            self.meta_year_var.set("")
-        if hasattr(self, 'meta_title_var'):
-            self.meta_title_var.set("")
-        if hasattr(self, 'meta_source_var'):
-            self.meta_source_var.set("")
-        if hasattr(self, 'meta_doi_var'):
-            self.meta_doi_var.set("")
-        if hasattr(self, 'library_notes_text'):
-            self.library_notes_text.delete("1.0", "end")
-        if hasattr(self, 'library_tags_text'):
-            self.library_tags_text.delete("1.0", "end")
+        self._clear_library_selection()
         self._update_library_scope_buttons()
         self._refresh_library_tree()
         self._set_status("Ready", "#3b8ed0")
         
     def _browse_directory(self):
         """Select a project folder and preview all discovered references immediately."""
-        directory = filedialog.askdirectory(title="Select folder with .bib files")
+        initial_path = self.dir_entry.get().strip()
+        initial_dir = initial_path if Path(initial_path).is_dir() else str(Path.home())
+        directory = filedialog.askdirectory(
+            title="Select folder with .bib files",
+            initialdir=initial_dir,
+        )
         if directory:
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, directory)
-            self._load_library_preview_from_source(directory)
+            self._select_project_source(directory)
 
     def _browse_project_source_file(self):
         """Select a source file or archive and preview its bibliography content."""
+        initial_path = self.dir_entry.get().strip()
+        initial_dir = str(Path(initial_path).parent) if Path(initial_path).is_file() else str(Path.home())
         file_path = filedialog.askopenfilename(
             title="Select project source file",
+            initialdir=initial_dir,
             filetypes=[
                 ("Supported sources", "*.zip *.tar *.tar.gz *.tgz *.bib *.tex"),
                 ("Zip archives", "*.zip"),
@@ -2956,9 +3671,7 @@ class ModernBibGUI:
             ],
         )
         if file_path:
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, file_path)
-            self._load_library_preview_from_source(file_path)
+            self._select_project_source(file_path)
 
     def _load_library_preview_from_source(self, source_path: str):
         """Load raw references from a folder, archive, or bibliography file."""
@@ -2994,14 +3707,16 @@ class ModernBibGUI:
 
             self.manager = BibliographyManager(str(working_directory))
             num_files, num_entries = self.manager.crawl_and_collect()
+            for warning in self.manager.report_data.get('parse_warnings', []):
+                self._log_message(f"⚠️ {warning}")
             self._load_library_entries()
 
             if num_entries > 0:
                 self._set_status(f"Loaded {num_entries} refs from {num_files} files", "#22c55e")
-                self._log_message(f"✓ Loaded {num_entries} references from {num_files} .bib file(s)")
+                self._log_message(f"✓ Loaded {num_entries} references from {num_files} bibliography source file(s)")
             else:
                 self._set_status("No references found", "#f59e0b")
-                self._log_message("⚠️ No .bib entries found in selected source")
+                self._log_message("⚠️ No bibliography entries found in selected source")
         except Exception as e:
             self._set_status("Preview load failed", "#ef4444")
             self._log_message(f"❌ Could not load references from source: {e}")
@@ -3094,6 +3809,8 @@ class ModernBibGUI:
     def _build_output_paths_text(self) -> str:
         """Build a human-readable block of output paths."""
         lines = []
+        if getattr(self, "_batch_outputs", []):
+            lines.append("Processed project copies:\n" + "\n".join(self._batch_outputs) + "\n")
         if self._last_master_path:
             lines.append(f"Master bibliography:\n{self._last_master_path}\n")
         if self._last_cleaned_zip:
@@ -3144,9 +3861,189 @@ class ModernBibGUI:
             return selected.parent, temp_dir_obj
 
         raise ValueError(f"Unsupported project source format: {selected.suffix or source_name}")
+
+    def _browse_batch_projects(self):
+        if self.processing:
+            messagebox.showwarning("Multiple projects", "A pipeline is already running.", parent=self.root)
+            return
+        parent_name = filedialog.askdirectory(title="Select the folder containing your projects", parent=self.root)
+        if not parent_name:
+            return
+        parent = Path(parent_name).resolve()
+        try:
+            projects = discover_projects(parent)
+        except (OSError, UnicodeError, ValueError) as error:
+            messagebox.showerror("Project discovery failed", str(error), parent=self.root)
+            return
+
+        if not projects:
+            messagebox.showinfo(
+                "No projects found",
+                "No LaTeX projects or bibliography files were found in the selected folder.",
+                parent=self.root,
+            )
+            return
+        try:
+            selected = validate_project_roots(parent, projects)
+        except ValueError as error:
+            self._resolve_batch_project_folders(parent, projects, str(error))
+            return
+        self._start_batch(selected)
+
+    def _resolve_batch_project_folders(self, parent: Path, projects: list[Path], reason: str):
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Resolve project folders")
+        dialog.geometry("760x480")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            dialog,
+            text=f"{reason}\nRemove or add folders to resolve the project boundaries before processing.",
+            justify="left", anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=15, pady=12)
+        listing = tk.Listbox(dialog, selectmode="extended", exportselection=False)
+        listing.grid(row=1, column=0, sticky="nsew", padx=15, pady=5)
+
+        def refresh():
+            listing.delete(0, tk.END)
+            for path in projects:
+                listing.insert(tk.END, str(path.relative_to(parent)) if path != parent else ".")
+
+        def add_folder():
+            folder = filedialog.askdirectory(parent=dialog, initialdir=str(parent), title="Add a project folder")
+            if folder:
+                path = Path(folder).resolve()
+                if path != parent and parent not in path.parents:
+                    messagebox.showerror("Invalid project", "Choose a folder inside the selected parent.", parent=dialog)
+                elif path in projects:
+                    messagebox.showwarning("Duplicate project", "That folder is already listed.", parent=dialog)
+                else:
+                    projects.append(path)
+                    refresh()
+
+        def remove_folders():
+            for index in reversed(listing.curselection()):
+                projects.pop(index)
+            refresh()
+
+        def start():
+            try:
+                selected = validate_project_roots(parent, projects)
+            except ValueError as error:
+                messagebox.showerror("Invalid project selection", str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self._start_batch(selected)
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.grid(row=2, column=0, sticky="ew", padx=15, pady=15)
+        ctk.CTkButton(buttons, text="Add folder", command=add_folder).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(buttons, text="Remove selected", command=remove_folders).pack(side="left")
+        ctk.CTkButton(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(buttons, text="Analyze projects", command=start).pack(side="right")
+        refresh()
+
+    def _start_batch(self, projects: list[Path]):
+        self._clear_for_next_run()
+        self.processing = True
+        self.manager = None
+        self._batch_outputs = []
+        self._last_master_path = None
+        self._last_cleaned_zip = None
+        self.report_path = None
+        self._key_review_event = None
+        self._key_review_push_back = True
+        self.run_btn.configure(state="disabled")
+        self.batch_btn.configure(state="disabled")
+        for widget in (self.browse_btn, self.source_file_btn, self.demo_btn, self.clear_btn, self.dir_entry):
+            widget.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.view_report_btn.configure(state="disabled")
+        self.log_text.delete("1.0", "end")
+        self.results_text.delete("1.0", "end")
+        self.results_text.insert("1.0", "Processing separate projects. Review each project's keys before output creation.")
+        self.results_scope_label.configure(text="Multiple projects")
+        for label in self.stat_labels.values():
+            label.configure(text="—")
+        self.reduction_bar.set(0)
+        self.keys_bar.set(0)
+        self.reduction_text.configure(text="—")
+        self.keys_text.configure(text="—")
+        self._pending_duplicates_refresh = False
+        self._set_status("Running batch...", "#f59e0b")
+        threshold = float(self.threshold_var.get())
+        generate_report = bool(self.report_var.get())
+        threading.Thread(
+            target=self._batch_worker, args=(projects, threshold, generate_report), daemon=True
+        ).start()
+
+    def _batch_worker(self, projects: list[Path], threshold: float, generate_report: bool):
+        project_positions = {project: index for index, project in enumerate(projects, start=1)}
+        def review(project: Path, manager: BibliographyManager) -> bool:
+            self.manager = manager
+            self._batch_project = project
+            self._batch_progress = (project_positions[project], len(projects))
+            event = threading.Event()
+            self._key_review_event = event
+            self._key_review_approved = False
+            def show_review():
+                if self.processing and self._key_review_event is event:
+                    self._show_key_review()
+                else:
+                    event.set()
+            self._ui_call(show_review)
+            event.wait()
+            approved = self._key_review_approved and self.processing
+            self._key_review_event = None
+            return approved
+
+        results = []
+        try:
+            results = process_projects(
+                projects, threshold, generate_report, review, lambda: not self.processing, self._log_message
+            )
+        except Exception as error:
+            self._log_message(f"Batch failed: {type(error).__name__}: {error}")
+            self._ui_call(messagebox.showerror, "Batch failed", str(error), parent=self.root)
+        finally:
+            self._batch_project = None
+            self._batch_progress = None
+            self.processing = False
+            self._ui_call(self._finish_batch, results)
+
+    def _finish_batch(self, results: list[dict]):
+        self.run_btn.configure(state="normal")
+        self.batch_btn.configure(state="normal")
+        for widget in (self.browse_btn, self.source_file_btn, self.demo_btn, self.clear_btn, self.dir_entry):
+            widget.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self.key_review_confirm_btn.configure(state="disabled")
+        self.key_review_cancel_btn.configure(state="disabled")
+        self._batch_outputs = [result["detail"] for result in results if result["status"] == "success"]
+        counts = Counter(result["status"] for result in results)
+        summary = (
+            f"Batch results: {counts['success']} completed, {counts['skipped']} skipped, "
+            f"{counts['error']} failed.\n\n"
+            + "\n\n".join(f"{r['status'].upper()}: {r['project']}\n{r['detail']}" for r in results)
+        )
+        self.results_text.delete("1.0", "end")
+        self.results_text.insert("1.0", summary)
+        self.key_review_status_label.configure(text="Batch finished. See Dashboard for per-project results.")
+        self.manager = None
+        self._load_batch_documents(results)
+        self.tabview.set("📈 Dashboard")
+        self._set_status("Batch finished" if results else "Batch failed", "#22c55e" if results and not counts["error"] else "#ef4444")
+        self._log_message(summary)
+        messagebox.showinfo("Multiple projects", summary, parent=self.root)
         
     def _run_pipeline(self):
         """Run the bibliography management pipeline"""
+        if self.processing:
+            self._log_message("⚠️ The pipeline is already running.")
+            return
+
         directory = self.dir_entry.get().strip()
         
         if not directory:
@@ -3156,17 +4053,39 @@ class ModernBibGUI:
         if not Path(directory).exists():
             self._log_message("❌ Directory does not exist!", "red")
             return
-        
+
         self._reset_tex_document_view("Processing project...")
+        self._batch_outputs = []
+        self._review_source = Path(directory).expanduser().resolve()
+        self._batch_progress = None
+        self.key_review_project_label.configure(text=f"Analyzing: {self._review_source.name or self._review_source.anchor}")
+        self.key_review_path_label.configure(text=f"Location: {self._review_source}")
+
+        try:
+            _save_last_source(str(Path(directory).expanduser().resolve()))
+        except OSError as error:
+            self._log_message(f"⚠️ Could not save the project path: {error}")
 
         # Clear previous results
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
         self.report_path = None
         self._ui_call(self.view_report_btn.configure, state="disabled")
+        self._key_review_items = []
+        self._key_review_event = None
+        self._key_review_approved = False
+        self._key_review_push_back = bool(self.push_var.get())
+        self.key_review_confirm_btn.configure(state="disabled", text="Create processed copy")
+        self.key_review_cancel_btn.configure(state="disabled")
+        self.key_review_status_label.configure(
+            text="Analyzing the project. Its real citation-key changes will appear here for review."
+        )
+        self.key_review_tree.delete(*self.key_review_tree.get_children())
+        self.key_review_count_label.configure(text="0 changes")
         
         # Disable run button
         self.run_btn.configure(state="disabled")
+        self.batch_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.processing = True
         self._set_status("Running...", "#f59e0b")
@@ -3194,6 +4113,7 @@ class ModernBibGUI:
         zip_mode = False
         zip_input_path = None
         cleaned_zip = None
+        processed_directory = None
         try:
             # Reset step states and timers for fresh run
             for step_name in self.step_cards:
@@ -3238,14 +4158,20 @@ class ModernBibGUI:
             if not self.processing:
                 self._log_message("⚠️ Pipeline cancelled by user.")
                 return
-            self._mark_step_running("Crawl", "Scanning .bib files...")
-            self._log_message("📁 Crawling for .bib files...")
+            self._mark_step_running("Crawl", "Scanning bibliography sources...")
+            self._log_message("📁 Crawling for .bib files and embedded BibTeX...")
             num_files, num_entries = self.manager.crawl_and_collect()
+            for warning in self.manager.report_data.get('parse_warnings', []):
+                self._log_message(f"⚠️ {warning}")
             self._log_message(f"✓ Found {num_files} file(s) with {num_entries} entries")
             self._mark_step_complete("Crawl")
             
             if num_entries == 0:
                 self._log_message("\n⚠️ No entries found!")
+                self._ui_call(
+                    self.key_review_status_label.configure,
+                    text="No bibliography entries were found in the selected source.",
+                )
                 return
             
             # Step 2: Find duplicates
@@ -3274,54 +4200,45 @@ class ModernBibGUI:
                 return
             self._mark_step_running("Keys", "Normalizing citation keys...")
             self._log_message("🔑 Normalizing citation keys...")
-            # Pass user rule to backend
-            rule = self.citekey_rule_var.get()
-            custom = self.citekey_custom_var.get()
-            if rule == "custom":
-                citekey_format = custom
-            elif rule == "author-year-title":
-                citekey_format = "{author}-{year}-{title}"
-            elif rule == "author-year-titleword":
-                citekey_format = "{author}-{year}-{titleword}"
-            elif rule == "author-title":
-                citekey_format = "{author}-{title}"
-            elif rule == "professor-style":
-                citekey_format = "{authorstem}{year}"
-            elif rule == "professor-strict":
-                citekey_format = "{authorstrict}{year}"
-            elif rule == "author-et-al-year":
-                citekey_format = "{authoretal}{year}"
-            elif rule == "lastname-only-year":
-                citekey_format = "{lastname}{year}"
-            elif rule == "firstauthor-year-titleword":
-                citekey_format = "{author}{year}{titleword}"
-            elif rule == "compact-initials":
-                citekey_format = "{authorinitials}{year}"
-            elif rule == "numeric":
-                citekey_format = "ref{numeric}"
-            else:
-                citekey_format = "{author}-{year}-{title}"
-            self.manager.fix_citation_keys(citekey_format)
+            self.manager.fix_citation_keys()
             self._log_message(f"✓ Normalized {len(self.manager.report_data['keys_changed'])} key(s)")
             self._mark_step_complete("Keys")
-            
-            # Create master
-            self._log_message("📋 Creating master bibliography...")
-            master_path = self.manager.create_master_bibliography()
-            self._log_message(f"✓ Master file generated")
-            self._last_master_path = str(master_path)
 
-            # Push back if requested
+            review_event = threading.Event()
+            self._key_review_event = review_event
+            self._key_review_approved = False
+            self._key_review_push_back = bool(options['push_back'])
+            self._pending_step_text = "Waiting for key review and confirmation..."
+            self._pending_step_color = "#f59e0b"
+            self._ui_call(self._apply_pipeline_snapshot)
+            self._ui_call(self._show_key_review)
+            review_event.wait()
+            review_approved = self._key_review_approved and self.processing
+            self._key_review_event = None
+            if not review_approved:
+                self._log_message("⚠️ Review cancelled; no processed output was created.")
+                self._set_status("Cancelled", "#f59e0b")
+                return
+            if not self.processing:
+                self._log_message("⚠️ Pipeline cancelled before output creation.")
+                return
+
             if push_back:
                 if not self.processing:
                     self._log_message("⚠️ Pipeline cancelled by user.")
                     return
-                self._log_message("\n📤 Pushing master.bib to folders...")
-                self.manager.push_to_folders(master_path)
-                self._log_message("✓ Distribution complete")
-            
+                self._log_message("\n📂 Creating processed project copy...")
+                processed_directory = self.manager.create_processed_copy()
+                master_path = processed_directory / "master.bib"
+                self._log_message(f"✓ Processed copy saved to {processed_directory}")
+            else:
+                self._log_message("📋 Creating master bibliography...")
+                master_path = Path(self.manager.create_master_bibliography())
+            self._last_master_path = str(master_path)
+
+            document_root = processed_directory or Path(working_directory)
             try:
-                self.manager.report_data["tex_documents"] = _collect_tex_documents(Path(working_directory))
+                self.manager.report_data["tex_documents"] = _collect_tex_documents(document_root)
             except (OSError, UnicodeError) as error:
                 self.manager.report_data["tex_preview_error"] = (
                     f"Could not load LaTeX document preview: {error}"
@@ -3344,11 +4261,13 @@ class ModernBibGUI:
                         archive_stem = archive_stem[: -len(suffix)]
                         break
                 cleaned_zip = zip_input_path.with_name(f"{archive_stem}_cleaned.zip")
+                archive_source = processed_directory or Path(working_directory)
+                archive_root = archive_source.parent if processed_directory else archive_source
                 with zipfile.ZipFile(str(cleaned_zip), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                    for root, _, files in os.walk(working_directory):
+                    for root, _, files in os.walk(archive_source):
                         for name in files:
                             file_path = Path(root) / name
-                            arcname = str(file_path.relative_to(working_directory))
+                            arcname = str(file_path.relative_to(archive_root))
                             zf.write(str(file_path), arcname)
                 self._log_message(f"✓ Cleaned ZIP created: {cleaned_zip}")
                 self._last_cleaned_zip = str(cleaned_zip)
@@ -3388,6 +4307,7 @@ class ModernBibGUI:
             self._ui_call(self._update_results)
             self._ui_call(self._load_tex_documents)
             self._ui_call(self._load_library_entries)
+            self._ui_call(self._complete_key_review, push_back)
             # Defer heavy duplicates rendering until user opens the Duplicates tab.
             self._pending_duplicates_refresh = True
             
@@ -3430,6 +4350,11 @@ class ModernBibGUI:
             self._pending_step_text = f"❌ Pipeline failed: {error_msg}"
             self._pending_step_color = "#ef4444"
             self._ui_call(self._apply_pipeline_snapshot)
+            failure_prefix = "Output creation failed" if self._key_review_approved else "Project analysis failed"
+            self._ui_call(
+                self.key_review_status_label.configure,
+                text=f"{failure_prefix}: {error_msg}",
+            )
             
         finally:
             if temp_dir_obj is not None:
@@ -3444,6 +4369,7 @@ class ModernBibGUI:
 
             self.processing = False
             self._ui_call(self.run_btn.configure, state="normal")
+            self._ui_call(self.batch_btn.configure, state="normal")
             self._ui_call(self.cancel_btn.configure, state="disabled")
             if self._status_text.get() == "Running...":
                 self._set_status("Ready", "#3b8ed0")
@@ -3452,6 +4378,17 @@ class ModernBibGUI:
         """Cancel pipeline execution"""
         # Simple cancellation (thread will finish current operation)
         self.processing = False
+        if self._key_review_event is not None:
+            self._key_review_approved = False
+            self._key_review_event.set()
+            self.key_review_confirm_btn.configure(state="disabled", text="Review cancelled")
+            self.key_review_cancel_btn.configure(state="disabled")
+            self.key_review_status_label.configure(
+                text=("Batch cancelled. Earlier processed copies remain available."
+                      if self._batch_project else "Review cancelled. No processed output was created.")
+            )
+        else:
+            self.key_review_status_label.configure(text="Cancellation requested. No review or output was confirmed.")
         self._log_message("\n⚠️ Cancellation requested...")
         self._set_status("Cancelling...", "#f59e0b")
         
@@ -3510,9 +4447,9 @@ class ModernBibGUI:
 
         if hasattr(self, 'results_scope_label'):
             if data.get('push_back'):
-                scope_text = "Changes pushed back to source folders"
+                scope_text = "Processed copy created; original files unchanged"
             else:
-                scope_text = "Review-only run; nothing was written back"
+                scope_text = "Master bibliography created; source files unchanged"
             self.results_scope_label.configure(text=scope_text)
         
         summary_lines = []
@@ -3533,11 +4470,10 @@ class ModernBibGUI:
         )
         summary_lines.append("")
         if data.get('push_back'):
-            summary_lines.append("Changes were pushed back into the source folders.")
-            summary_lines.append("Backups are available in timestamped backup folders beside the original .bib files.")
+            summary_lines.append(f"Processed project copy: {data.get('processed_copy_path', '')}")
+            summary_lines.append("Original bibliography and LaTeX files were left unchanged.")
         else:
-            summary_lines.append("This was a review-only run. Nothing was written back to the source folders.")
-            summary_lines.append("Use the Pipeline tab to rerun with push-back enabled if you want the files updated in place.")
+            summary_lines.append("Only master.bib was created; source bibliography and LaTeX files were left unchanged.")
         summary_lines.append("")
         summary_lines.append("Next step: inspect the most changed files below, then open Fixes for line-level diffs if something looks off.")
 

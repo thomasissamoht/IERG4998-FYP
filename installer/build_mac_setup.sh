@@ -15,8 +15,13 @@ fi
 
 OUT_DIR="installer/output"
 APP_BUNDLE="dist/${APP_NAME}.app"
-ZIP_OUT="${OUT_DIR}/BibTeXManager-mac-${VERSION}.zip"
-DMG_OUT="${OUT_DIR}/BibTeXManager-mac-${VERSION}.dmg"
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64|x86_64) ;;
+  *) echo "Unsupported macOS architecture: $ARCH" >&2; exit 1 ;;
+esac
+ZIP_OUT="${OUT_DIR}/BibTeXManager-mac-${VERSION}-${ARCH}.zip"
+DMG_OUT="${OUT_DIR}/BibTeXManager-mac-${VERSION}-${ARCH}.dmg"
 ICON_PATH="installer/app.icns"
 
 mkdir -p "$OUT_DIR"
@@ -67,6 +72,10 @@ python -m PyInstaller "${PYINSTALLER_ARGS[@]}" bib_gui_modern.py
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
   echo "Expected app bundle not found: $APP_BUNDLE"
+  exit 1
+fi
+if ! lipo -archs "$APP_BUNDLE/Contents/MacOS/$APP_NAME" | tr ' ' '\n' | grep -Fxq "$ARCH"; then
+  echo "Built app does not contain the expected $ARCH architecture." >&2
   exit 1
 fi
 

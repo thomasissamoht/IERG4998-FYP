@@ -4,7 +4,7 @@
 
 You do not need Python, Xcode, or project dependencies to use a published desktop release:
 
-1. Download `BibTeXManager-mac-<version>.dmg` from the repository's [latest GitHub Release](https://github.com/thomasissamoht/IERG4998-FYP/releases/latest).
+1. Download `BibTeXManager-mac-<version>-x86_64.dmg` for an Intel Mac (including iMac 2020), or the `arm64` DMG for Apple Silicon, from the repository's [latest GitHub Release](https://github.com/thomasissamoht/IERG4998-FYP/releases/latest).
 2. Open the DMG and drag **BibTeX Manager** to Applications.
 3. Open it from Applications.
 
@@ -15,8 +15,8 @@ The remaining setup instructions below are for maintainers building the app manu
 ## 🎯 For Mac Demonstration
 
 ### System Requirements
-- **macOS** 10.14 or later
-- **Python** 3.8 or later (built-in or from python.org)
+- **macOS**: Intel and Apple Silicon packages are built on macOS 15; compatibility with older macOS releases has not been verified.
+- **Python** 3.11 for source setup (from python.org)
 - **Xcode Command Line Tools** (for first-time setup)
 
 ---
@@ -36,25 +36,27 @@ chmod +x installer/build_mac_setup.sh
 ```
 
 Output files:
-- `installer/output/BibTeXManager-mac-<version>.dmg` (preferred)
-- `installer/output/BibTeXManager-mac-<version>.zip` (fallback)
+- `installer/output/BibTeXManager-mac-<version>-<architecture>.dmg` (preferred)
+- `installer/output/BibTeXManager-mac-<version>-<architecture>.zip` (fallback)
 
 ### Build automatically on GitHub (no local Mac required)
 
 This project includes `.github/workflows/build-macos.yml`.
 After you push to `master` or `main`, GitHub Actions will:
-1. Start a macOS runner
-2. Run `installer/build_mac_setup.sh`
-3. Upload `.dmg` and `.zip` as workflow artifacts
+1. Start separate Intel and Apple Silicon macOS runners
+2. Run `installer/build_mac_setup.sh` on each runner
+3. Upload architecture-specific `.dmg` and `.zip` workflow artifacts
 
 To download the built files:
 1. Open your repository on GitHub
 2. Go to **Actions**
 3. Open the latest **Build macOS Installer** run
-4. Download the **macos-installer** artifact
+4. Download the **macos-x86_64-installer** or **macos-arm64-installer** artifact
+
+For a shareable release link containing both the Windows installer and macOS packages, update `VERSION` and push a matching version tag (for example, `VERSION` contains `1.0.10` and the tag is `v1.0.10`). The **Release Desktop Apps** workflow validates the version, builds both platforms, and attaches the installers to the repository's **Releases** page after both builds succeed.
 
 ### End-user install on clean Mac
-1. Download `BibTeXManager-mac-<version>.dmg`
+1. Download the DMG for your Mac's architecture (`x86_64` for Intel, `arm64` for Apple Silicon).
 2. Open DMG and drag `BibTeX Manager.app` to Applications
 3. Launch from Applications
 
@@ -71,7 +73,7 @@ xcode-select --install
 ### Step 2: Verify Python Installation
 ```bash
 python3 --version
-# Should show Python 3.8+
+# Use Python 3.11, as in the release build
 ```
 
 If Python is not installed, download from https://www.python.org/downloads/
@@ -113,6 +115,16 @@ python3 bib_gui_modern.py
 - Beautiful dark/light theme
 - Perfect for live demonstration
 - Works offline
+
+For several projects, select **Process multiple projects**, choose their parent
+folder, and review each project's proposed citation-key changes. Each approved
+project receives its own processed copy. Afterward, select a project and `.tex`
+file in **Documents** to inspect updated citations. Folder detection is
+heuristic; check each project name and location during review.
+
+Standalone `.tex` files may contain BibTeX in `filecontents` blocks or literal
+`\bibitem` entries in `thebibliography`. Manual bibliography entries keep their
+original keys and are exported as unstructured BibTeX notes.
 
 ### Option B: Web App 🌐
 ```bash
@@ -249,9 +261,10 @@ streamlit run bib_streamlit.py --logger.level=debug
    - Interactive elements
    - All statistics in one place
 
-4. **Show Download** of master.bib
-   - Distributed to folders
-   - Backups created
+4. **Show the processed project copy**
+   - Updated `.bib` and `.tex` files are together in `processed/`
+   - Original source files stay unchanged
+   - Dropbox can sync the processed folder to the Overleaf-linked project
 
 ### If GUI Has Issues:
 - Fall back to web app (more reliable cross-platform)
@@ -299,9 +312,9 @@ chmod +x launch_demo.sh
    - ✓ Detects duplicates (exact and fuzzy)
    - ✓ Intelligently removes duplicates
    - ✓ Normalizes citation keys
-   - ✓ Creates backups before changes
+   - ✓ Preserves originals by creating a processed project copy
    - ✓ Generates HTML reports
-   - ✓ Distributes to original folders
+   - ✓ Creates a processed folder beside the source
 
 3. **With Real Files:**
    - Show it processing actual bibliography
