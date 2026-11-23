@@ -13,7 +13,7 @@ class ProjectBatchTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
 
     def make_project(self, name, author, year, key="same"):
         root = self.root / name
@@ -40,6 +40,12 @@ class ProjectBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             validate_project_roots(self.root, [first, nested])
         self.assertEqual(validate_project_roots(self.root, [first, second]), [first, second])
+
+    def test_discovery_resolves_temporary_folder_alias(self):
+        project = self.make_project("paper", "Smith", 2020)
+        alias = Path(self.temporary.name)
+        self.assertEqual(discover_projects(alias), [project])
+        self.assertEqual(validate_project_roots(alias, [project]), [project])
 
     def test_projects_with_same_keys_are_reviewed_and_written_independently(self):
         first = self.make_project("first", "Smith", 2020)
