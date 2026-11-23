@@ -204,6 +204,7 @@ def _rewrite_bib_keys(text: str, mapping: Dict[str, str]) -> str:
         r'(?:crossref|xdata)\s*=\s*(\{[^{}]*\}|"[^"]*"|[^,\s}]+)',
         re.IGNORECASE,
     )
+    header_pattern = re.compile(r'@\w+\s*([\{(])')
     edits = []
     depth = 0
     outer = ''
@@ -218,9 +219,9 @@ def _rewrite_bib_keys(text: str, mapping: Dict[str, str]) -> str:
                 previous = character
                 continue
             if character == '@':
-                header = re.match(r'@\w+\s*([\{(])', text[index:])
+                header = header_pattern.match(text, index)
                 if header:
-                    opener = index + header.end() - 1
+                    opener = header.end() - 1
                     outer = header.group(1)
             continue
         if escaped:
@@ -253,9 +254,15 @@ def _rewrite_bib_keys(text: str, mapping: Dict[str, str]) -> str:
                 edits.append((match.start(1), match.end(1), replacement))
         if not character.isspace():
             previous = character
-    for start, end, replacement in reversed(edits):
-        text = text[:start] + replacement + text[end:]
-    return text
+    if not edits:
+        return text
+    parts = []
+    position = 0
+    for start, end, replacement in edits:
+        parts.extend((text[position:start], replacement))
+        position = end
+    parts.append(text[position:])
+    return ''.join(parts)
 
 
 def _parse_large_bibtex(text: str) -> Tuple[List[Dict], List[str]]:
@@ -1486,7 +1493,7 @@ class BibliographyManager:
         duplicate_count = sum(len(group) - 1 for group in self.report_data['duplicate_groups'])
         
         # Build HTML
-        html = f"""<!DOCTYPE html>
+        html = [f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1710,22 +1717,22 @@ class BibliographyManager:
                     </span>
                 </p>
             </div>
-"""
+"""]
         
         # Duplicate groups section
         if self.report_data['duplicate_groups']:
-            html += """
+            html.append("""
             <div class="section">
                 <h2>🔍 Duplicate Analysis</h2>
-"""
+""")
             for idx, group_data in enumerate(self.report_data['duplicate_groups'], 1):
                 entries = group_data['entries']
                 similarity = group_data.get('similarity', 'N/A')
                 
-                html += f"""
+                html.append(f"""
                 <div class="duplicate-group">
                     <h3>Duplicate Group {idx} <span class="badge similarity">{similarity}% Similar</span></h3>
-"""
+""")
                 for entry_idx, entry in enumerate(entries):
                     is_kept = entry_idx == 0  # First entry is kept
                     badge_class = "kept" if is_kept else "removed"
@@ -1735,48 +1742,48 @@ class BibliographyManager:
                     author = entry.get('author', 'Unknown')
                     year = entry.get('year', 'N/A')
                     
-                    html += f"""
+                    html.append(f"""
                     <div class="entry {badge_class}">
                         <span class="badge {badge_class}">{badge_text}</span>
                         <span class="entry-key">{entry.get('ID', 'unknown')}</span>
                         <div class="entry-title">{title[:100]}...</div>
                         <div class="entry-meta">👤 {author[:50]} | 📅 {year}</div>
                     </div>
-"""
-                html += """
+""")
+                html.append("""
                 </div>
-"""
-            html += """
+""")
+            html.append("""
             </div>
-"""
+""")
         
         # Citation key changes
         if self.report_data['keys_changed']:
-            html += """
+            html.append("""
             <div class="section">
                 <h2>🔑 Citation Key Normalization</h2>
                 <div class="key-changes">
-"""
+""")
             for old_key, new_key in self.report_data['keys_changed'][:20]:  # Show first 20
-                html += f"""
+                html.append(f"""
                     <div class="key-change">
                         <span style="color: #dc3545;">{old_key}</span>
                         <span class="arrow">→</span>
                         <span style="color: #28a745;">{new_key}</span>
                     </div>
-"""
+""")
             if len(self.report_data['keys_changed']) > 20:
-                html += f"""
+                html.append(f"""
                     <p style="margin-top: 15px; color: #666;">
                         ... and {len(self.report_data['keys_changed']) - 20} more changes
                     </p>
-"""
-            html += """
+""")
+            html.append("""
                 </div>
             </div>
-"""
+""")
         
-        html += """
+        html.append("""
         </div>
         
         <div class="footer">
@@ -1787,11 +1794,11 @@ class BibliographyManager:
         </div>
     </div>
 </body>
-</html>"""
+</html>""")
         
         # Write to file
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(html)
+            f.write("".join(html))
         
         print(f"\n📊 HTML Report generated: {output_path}")
         return output_path

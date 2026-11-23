@@ -116,11 +116,29 @@ python3 bib_gui_modern.py
 - Perfect for live demonstration
 - Works offline
 
-For several projects, select **Process multiple projects**, choose their parent
-folder, and review each project's proposed citation-key changes. Each approved
-project receives its own processed copy. Afterward, select a project and `.tex`
-file in **Documents** to inspect updated citations. Folder detection is
-heuristic; check each project name and location during review.
+Choose a project folder, or a parent folder containing several projects, then
+select **Analyze & Review**. For multiple projects, the app analyzes every
+project first, then shows their current and proposed keys together, including
+unchanged keys and merged duplicates. Review the list and confirm once to
+create the processed copies. Projects that could not be analyzed are shown
+with their errors and are skipped; successful projects can still be processed.
+If source `.bib` or `.tex` files change during analysis or after review,
+that project must be analyzed again. For multiple projects, the
+processed-copy option must be enabled in **Show advanced settings**.
+Folder detection is heuristic: a folder containing a `.bib` or `.tex` file
+is treated as one project, including all its
+subfolders. If independent projects are nested under it, select them separately
+instead. Check each project name and location during review.
+
+After processing multiple projects, select a project and `.tex` file in
+**Documents** to inspect updated citations. If an error occurs, the dialog
+shows the error and the location of a diagnostic log; on macOS this is
+`~/Library/Application Support/BibTeXManager/app.log`. The log may contain
+local paths, so review it before sharing.
+
+Previews load in the background. For sources with at least 5 MiB of `.bib`
+and `.tex` files, the initial preview is skipped so the source is not parsed
+twice; choose **Analyze & Review** to process it instead.
 
 Standalone `.tex` files may contain BibTeX in `filecontents` blocks or literal
 `\bibitem` entries in `thebibliography`. Manual bibliography entries keep their

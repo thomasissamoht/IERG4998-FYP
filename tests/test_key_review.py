@@ -32,6 +32,10 @@ class FakeWidget:
 class FakeTree:
     def __init__(self):
         self.rows = []
+        self.config = {}
+
+    def configure(self, **kwargs):
+        self.config.update(kwargs)
 
     def delete(self, *_items):
         self.rows.clear()
@@ -84,7 +88,7 @@ class KeyReviewTests(unittest.TestCase):
         gui.key_review_search_var.set("d2023")
         gui._filter_key_review()
 
-        self.assertEqual(gui.key_review_tree.rows, [("oldDoe2023", "D2023")])
+        self.assertEqual(gui.key_review_tree.rows, [("", "oldDoe2023", "D2023")])
         self.assertEqual(gui.key_review_count_label.config["text"], "1 of 2 changes")
 
     def test_approval_releases_pipeline_worker(self):
@@ -110,6 +114,36 @@ class KeyReviewTests(unittest.TestCase):
         gui._show_key_review()
         self.assertEqual(gui.key_review_project_label.config["text"], "Reviewing: Other Paper  (project 4 of 4)")
         self.assertEqual(gui.key_review_path_label.config["text"], f"Location: {gui._batch_project}")
+
+    def test_combined_batch_review_shows_all_keys_and_project_failures(self):
+        gui = self.make_gui([])
+        first = Path("workspace") / "First Paper"
+        second = Path("workspace") / "Failed Paper"
+        manager = SimpleNamespace(report_data={
+            "key_audit": [
+                {"Original Raw Key": "old", "Normalized Key": "S2024"},
+                {"Original Raw Key": "same", "Normalized Key": "same"},
+            ],
+            "duplicate_groups": [{"entries": [
+                {"ID": "old", "_status": "kept"},
+                {"ID": "duplicate", "_status": "removed"},
+            ]}],
+        })
+        gui._show_batch_key_review([
+            {"project": first, "status": "ready", "manager": manager},
+            {"project": second, "status": "error", "detail": "Could not read source"},
+        ])
+        self.assertEqual(gui.key_review_tree.rows, [
+            (str(first), "old", "S2024"),
+            (str(first), "same", "same"),
+            (str(first), "duplicate", "Merged duplicate (not in master)"),
+            (str(second), "ERROR", "Could not read source"),
+        ])
+        self.assertEqual(gui.key_review_confirm_btn.config["text"], "Create ready project copies")
+        self.assertIn("1 ready, 1 failed", gui.key_review_status_label.config["text"])
+        gui.key_review_search_var.set("failed paper")
+        gui._filter_key_review()
+        self.assertEqual(gui.key_review_tree.rows, [(str(second), "ERROR", "Could not read source")])
 
     def test_single_file_review_uses_original_source_name(self):
         gui = self.make_gui([])

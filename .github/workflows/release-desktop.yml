@@ -93,6 +93,9 @@ jobs:
       - name: Build macOS package
         run: APP_VERSION="${GITHUB_REF_NAME#v}" ./installer/build_mac_setup.sh
 
+      - name: Test desktop project processing
+        run: ./venv/bin/python -m unittest tests.test_project_batch tests.test_gui_settings tests.test_tex_document_preview tests.test_key_review
+
       - name: Upload macOS packages
         uses: actions/upload-artifact@v4
         with:

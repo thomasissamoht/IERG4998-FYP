@@ -122,6 +122,17 @@ class EmbeddedFileContentsTests(unittest.TestCase):
         self.assertIn("title = {Example, crossref={old}}", updated)
         self.assertIn(" crossref = {new}", updated)
 
+    def test_key_rewrite_handles_multiple_crossref_and_xdata_fields(self):
+        source = (
+            '@book{old, title={crossref={old}}, crossref={old}, xdata="old, other"}\n'
+            '@book(other, crossref=old, xdata={other, old})\n'
+        )
+        self.assertEqual(
+            _rewrite_bib_keys(source, {"old": "new", "other": "second"}),
+            '@book{new, title={crossref={old}}, crossref={new}, xdata="new, second"}\n'
+            '@book(second, crossref=new, xdata={second, new})\n',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
