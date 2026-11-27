@@ -28,6 +28,15 @@ class FakeWidget:
     def set(self, value):
         self.value = value
 
+    def get(self):
+        return self.value
+
+    def grid(self):
+        pass
+
+    def grid_remove(self):
+        pass
+
 
 class FakeTree:
     def __init__(self):
@@ -64,8 +73,13 @@ class KeyReviewTests(unittest.TestCase):
         gui.key_review_path_label = FakeWidget()
         gui.key_review_confirm_btn = FakeWidget()
         gui.key_review_cancel_btn = FakeWidget()
+        gui.key_review_mark_btn = FakeWidget()
+        gui.key_review_project_menu = FakeWidget()
+        gui.key_review_progress = FakeWidget()
+        gui.key_review_single_btn = FakeWidget()
         gui.tabview = FakeWidget()
         gui._apply_pipeline_snapshot = lambda: None
+        gui._set_status = lambda *args: None
         return gui
 
     def test_review_uses_real_changed_keys_and_search_filters_both_columns(self):
@@ -115,11 +129,12 @@ class KeyReviewTests(unittest.TestCase):
         self.assertEqual(gui.key_review_project_label.config["text"], "Reviewing: Other Paper  (project 4 of 4)")
         self.assertEqual(gui.key_review_path_label.config["text"], f"Location: {gui._batch_project}")
 
-    def test_combined_batch_review_shows_all_keys_and_project_failures(self):
+    def test_batch_review_is_per_project_and_requires_each_ready_project(self):
         gui = self.make_gui([])
         first = Path("workspace") / "First Paper"
         second = Path("workspace") / "Failed Paper"
-        manager = SimpleNamespace(report_data={
+        third = Path("workspace") / "Third Paper"
+        manager = SimpleNamespace(root_files_only=False, report_data={
             "key_audit": [
                 {"Original Raw Key": "old", "Normalized Key": "S2024"},
                 {"Original Raw Key": "same", "Normalized Key": "same"},
@@ -132,18 +147,49 @@ class KeyReviewTests(unittest.TestCase):
         gui._show_batch_key_review([
             {"project": first, "status": "ready", "manager": manager},
             {"project": second, "status": "error", "detail": "Could not read source"},
+            {"project": third, "status": "ready", "manager": manager},
         ])
         self.assertEqual(gui.key_review_tree.rows, [
             (str(first), "old", "S2024"),
             (str(first), "same", "same"),
             (str(first), "duplicate", "Merged duplicate (not in master)"),
-            (str(second), "ERROR", "Could not read source"),
         ])
-        self.assertEqual(gui.key_review_confirm_btn.config["text"], "Create ready project copies")
-        self.assertIn("1 ready, 1 failed", gui.key_review_status_label.config["text"])
-        gui.key_review_search_var.set("failed paper")
-        gui._filter_key_review()
+        self.assertEqual(gui.key_review_confirm_btn.config["state"], "disabled")
+        gui._select_batch_key_review(str(second))
         self.assertEqual(gui.key_review_tree.rows, [(str(second), "ERROR", "Could not read source")])
+        gui.key_review_project_menu.set(str(first))
+        gui._mark_batch_project_reviewed()
+        self.assertEqual(gui.key_review_project_menu.get(), str(third))
+        self.assertEqual(gui.key_review_confirm_btn.config["state"], "disabled")
+        gui._mark_batch_project_reviewed()
+        self.assertEqual(gui.key_review_confirm_btn.config["state"], "normal")
+        gui._batch_review_waiting = False
+        gui._batch_review_results[0].update(status="success", detail="output")
+        gui._select_batch_key_review(str(first))
+        self.assertEqual(gui.key_review_tree.rows[0], (str(first), "old", "S2024"))
+        self.assertEqual(gui.key_review_confirm_btn.config["state"], "disabled")
+
+    def test_key_review_paginates_large_projects(self):
+        gui = self.make_gui([(f"old{i}", f"new{i}") for i in range(1200)])
+        gui._show_key_review()
+        self.assertEqual(len(gui.key_review_tree.rows), 500)
+        gui._change_key_review_page(1)
+        self.assertEqual(gui.key_review_tree.rows[0], ("", "old500", "new500"))
+        gui._change_key_review_page(1)
+        self.assertEqual(len(gui.key_review_tree.rows), 200)
+
+    def test_project_inventory_is_shown_before_analysis(self):
+        gui = self.make_gui([])
+        gui.dir_entry = FakeVariable("workspace")
+        projects = [Path("workspace") / "one", Path("workspace") / "two"]
+        gui._show_discovered_projects(projects)
+        self.assertEqual(gui.key_review_project_label.config["text"], "2 projects found")
+        self.assertEqual([row[0] for row in gui.key_review_tree.rows], list(map(str, projects)))
+        self.assertEqual(gui.key_review_confirm_btn.config["text"], "Analyze projects")
+        started = []
+        gui._start_batch = started.extend
+        gui._approve_key_review()
+        self.assertEqual(started, projects)
 
     def test_single_file_review_uses_original_source_name(self):
         gui = self.make_gui([])

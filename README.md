@@ -6,10 +6,11 @@ A comprehensive, cross-platform tool for managing, deduplicating, and organizing
 
 - **🔍 Intelligent Duplicate Detection** - Fuzzy matching for similar entries, DOI verification for exact matches
 - **🗑️ Smart Deduplication** - Merges duplicates intelligently, keeps most complete entry
-- **🔑 Citation Key Normalization** - Standardizes citation keys to `firstname-year-keyword` format
+- **🔑 Citation Key Normalization** - Uses each author's surname initial plus publication year; repeated author/year keys receive `a`, `b`, `c` suffixes
+- **👀 Review Before Export** - Inspect and filter the actual old-to-new citation-key mappings, then confirm before creating output
 - **📂 Batch Processing** - Crawls folders recursively, processes hundreds of files
-- **📄 LaTeX Preview** - Inspect project `.tex` files and normalized citation keys after processing
-- **💾 Automatic Backups** - Timestamped backups created before any changes
+- **💾 Source Preservation** - Creates a processed project copy and leaves original bibliography and LaTeX files unchanged
+- **📄 Document Preview** - View supported project text files in Documents; changed citations in `.tex` files have highlighting and next/previous navigation
 - **📊 Beautiful HTML Reports** - Professional reports with statistics and duplicate analysis
 - **🎨 Modern GUI** - CustomTkinter interface with system-aware light/dark themes, consistent colors, and adaptive window sizing
 - **🌐 Web App** - Streamlit interface for cloud deployment
@@ -22,7 +23,7 @@ A comprehensive, cross-platform tool for managing, deduplicating, and organizing
 Download the latest installer from the repository's [GitHub Releases](https://github.com/thomasissamoht/IERG4998-FYP/releases/latest):
 
 - **Windows:** Download `BibTeXManagerSetup.exe`, run it, and launch **BibTeX Manager** from the Start menu.
-- **macOS:** Download `BibTeXManager-mac-<version>.dmg`, open it, and drag **BibTeX Manager** to Applications.
+- **macOS:** Download `BibTeXManager-mac-<version>-x86_64.dmg` for Intel or `BibTeXManager-mac-<version>-arm64.dmg` for Apple Silicon, open it, and drag **BibTeX Manager** to Applications.
 
 Choose the file for your operating system. The installers include the app and its runtime dependencies; you do not need to install Python or run `pip`. Because these builds are currently unsigned/not notarized, Windows SmartScreen or macOS Gatekeeper may show a first-launch warning. Only continue if the installer came from this repository's Releases page. On Mac, Control-click the app and choose **Open** to approve it.
 
@@ -79,6 +80,12 @@ Modern desktop interface with:
 - One-click HTML report viewing
 - Dark/light mode toggle
 
+In the Library tab, select a reference to enable its inspector actions. Choose a collection destination before adding it; metadata edits, notes, tags, and collections are kept for the current app session and are not written to the source `.bib` files.
+
+For a folder containing multiple projects, click **Analyze & Review** to see the discovered project locations, then **Analyze projects**. The Pipeline tab shows the current project and stage. In **Key Review**, choose each project, inspect its keys (using the page controls for large lists), and mark it reviewed. Once all ready projects are reviewed, click **Process reviewed projects**. Completed results become available as processing continues: use **Result project** to switch the Dashboard, Library, Duplicates, Fixes, and Documents to a completed project. Use **Open Report** to open its HTML report, if enabled. Failed or empty projects are listed separately; source projects remain unchanged.
+
+Root-level `.tex` and `.bib` files are grouped into separate projects when multiple groups or subfolder projects are found. Literal `\input`, `\include`, `\bibliography`, and `\addbibresource` links and matching citation keys connect files; common keys can therefore connect otherwise separate documents. The list shows each group's files. Each group's processed copy contains only its root-level `.tex` and `.bib` files, not other files, assets, or subfolders; add any needed assets separately. Dynamic LaTeX paths and links to subfolder files are not used for grouping. To treat the folder and its subfolders as one project instead, choose **Treat this folder as one project**.
+
 ### 2. Web App 🌐
 ```bash
 streamlit run bib_streamlit.py
@@ -125,8 +132,9 @@ The `test_data/` folder contains sample .bib files for testing:
 ```bash
 python3 bib_gui_modern.py
 # Click "Browse" → Select "test_data" folder
-# Click "Run Pipeline"
-# View results and generated HTML report
+# Click "Analyze & Review"
+# Inspect the proposed citation-key mappings in Key Review
+# Confirm to create the processed project copy, then view results and the HTML report
 ```
 
 Expected results:
@@ -141,7 +149,7 @@ Expected results:
 ### The 4-Step Pipeline
 
 1. **Crawl** 📁
-   - Recursively searches directory for .bib files
+   - Recursively searches the selected directory for `.bib` files and line-delimited `filecontents` / `filecontents*` blocks containing `.bib` files in `.tex` documents
    - Collects all bibliography entries
    - Preserves file information
 
@@ -159,14 +167,39 @@ Expected results:
    - Eliminates redundant entries
 
 4. **Normalize Keys** 🔑
-   - Default: concatenate the first letter of every author's surname with the four-digit year (`Smith and Doe`, 2024 → `SD2024`)
-   - Papers with the same author initials and year receive lowercase `a`, `b`, `c`... suffixes in source order (`SD2024`, `SD2024a`, `SD2024b`)
-   - Uses `X` when no author is available and `0000` when no four-digit year is available
+   - Concatenates the first letter of each author's surname and adds the four-digit publication year (`Smith and Doe`, 2024 → `SD2024`)
+   - Gives the first paper that author/year key; subsequent papers with the same initials and year receive `a`, `b`, `c` suffixes in source order (`SD2024`, `SD2024a`, `SD2024b`)
+   - Uses `X` for records with no author surname and `0000` when no four-digit year is available
+   - Scans source files in path order and keeps the entry order within each file, so suffixes are repeatable
+   - Shows the exact old-to-new mappings in Key Review before writing output; after confirmation, creates a `processed` project folder beside the selected project with updated `.bib` and `.tex` files plus `master.bib`
+   - Leaves the original files unchanged; later runs create a timestamped `processed_...` folder rather than replacing an existing result
+
+For the web app, download the processed project ZIP and extract its top-level processed folder inside the Dropbox-synced project. That keeps the result as a nested folder in the existing Overleaf project; it does not create a separate Overleaf project.
+
+The desktop GUI remembers the last selected project folder or source file in the current user's app settings and restores its preview on the next launch. It does not automatically run processing; use **Browse** to change projects. If the saved location is unavailable (for example, a disconnected drive), select the project again.
+
+For an embedded `filecontents` bibliography, the processed copy keeps the block and updates its BibTeX keys and document citations. The app stops if an external file conflicts with the embedded filename, if the embedded filename is `master.bib`, or if the block is unclosed. Only blocks whose begin and end commands are on their own lines are recognized.
+
+The app also reads literal `\bibitem` commands in `thebibliography` environments, including optional labels. It preserves their keys and formatting in the processed `.tex` rather than guessing author, title, or year from free-form text. The generated `master.bib` contains `@misc` entries with the reference text in `note`; these entries are not guaranteed to reproduce the manually formatted bibliography. Duplicate manual keys and conflicts with BibTeX keys must be resolved before processing. Macro-generated items are not supported.
+
+Selecting an individual file scans its parent folder. For multiple separate projects in the desktop app:
+
+1. Choose the parent folder and click **Analyze & Review**. Inspect the detected projects and click **Analyze projects**.
+2. Review and mark each ready project in **Key Review**, then click **Process reviewed projects**. Cancelling stops the remaining batch; copies already created remain in place.
+3. The dashboard lists completed, skipped, and failed projects and their output paths. Each completed project gets its own processed folder and `master.bib`. With HTML reports enabled, each report is inside its processed folder. Originals remain unchanged.
+
+In **Documents**, select a completed project and a text file to preview it in the app. Supported UTF-8 files include `.tex`, `.bib`, `.txt`, `.md`, `.csv`, `.tsv`, `.json`, `.yaml`, `.yml`, `.sty`, `.cls`, `.cfg`, `.bst`, `.bbl`, `.ini`, `.log`, `.xml`, and `.html`. The viewer shows files in the processed copy; root-level project groups contain only their selected `.tex` and `.bib` files. For `.tex` files, jump between citations actually rewritten during processing. If the processed file is edited afterward, navigation is disabled because the saved positions may no longer be valid. Citations to duplicate entries removed during merging may remain unchanged; review them manually.
+
+Generated `processed`, `processed_*`, and `backup_*` folders are excluded. The batch always creates processed copies, regardless of the single-project copy option.
+
+### Dropbox and Overleaf
+
+The app does not connect to Dropbox directly. With Overleaf's Dropbox integration enabled for the account, Dropbox syncs the contents of its `Apps/Overleaf` folder with Overleaf. The desktop app's processed copy is created inside the selected source folder, so it will appear as a nested folder in that existing Overleaf project if the source is already synced. To make the processed result a separate Overleaf project, place or copy the processed folder directly under `Dropbox/Apps/Overleaf` (not inside another project folder). Dropbox then syncs that top-level folder as its own project. Confirm the result in Overleaf before deleting or replacing any files.
 
 ### Safety Features
 
-- **Automatic Backups** - Timestamped backup folders created before changes
-- **No Data Loss** - Original files preserved, can restore anytime
+- **Originals Preserved** - The processed folder is a copy; source `.bib` and `.tex` files are not overwritten
+- **Repeatable Output** - Existing processed results are kept and later runs use a timestamped folder
 - **Safe Processing** - Validation at each step
 - **Error Handling** - Graceful handling of corrupt or locked files
 
@@ -174,17 +207,13 @@ Expected results:
 
 ### Generated Files
 
-1. **master.bib**
+1. **Processed project folder**
    - Clean, deduplicated bibliography
    - Normalized citation keys
-   - Distributed to original folders
+   - Updated `.bib` and `.tex` files and a `master.bib`
+   - Created beside the source project as `processed/` (or `processed_<timestamp>/`)
 
-2. **Backup Folders**
-   - `backup_YYYYMMDD_HHMMSS/` in each directory
-   - Original files preserved
-   - Can restore if needed
-
-3. **HTML Report**
+2. **HTML Report**
    - `report_YYYYMMDD_HHMMSS.html`
    - Beautiful, professional styling
    - Statistics and metrics
@@ -258,7 +287,7 @@ Click "Browse" → Select folder
 
 # 3. Configure settings
 Similarity threshold: 85% (default)
-Push to folders: Yes
+Create processed copy: Yes
 Generate report: Yes
 
 # 4. Run pipeline

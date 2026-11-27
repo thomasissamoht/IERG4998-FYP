@@ -342,6 +342,9 @@ class BibliographyManager:
         self.embedded_bib_files: List[Path] = []
         self.strict_source_errors = False
         self.include_source_master = False
+        self.root_files_only = False
+        self.selected_root_files: set[str] | None = None
+        self.output_name = "processed"
         self.report_data: Dict = {
             'start_time': None,
             'end_time': None,
@@ -465,13 +468,16 @@ class BibliographyManager:
         
         # Find all .bib files recursively (exclude master.bib and backups)
         root_path = Path(self.root_directory).resolve()
+        source_root = Path(self.root_directory)
+        bib_files = source_root.glob("*.bib") if self.root_files_only else source_root.rglob("*.bib")
         all_bib_files = sorted(
-            Path(self.root_directory).rglob("*.bib"),
+            bib_files,
             key=lambda path: path.relative_to(self.root_directory).as_posix().casefold(),
         )
         self.bib_files = [
             bib_file for bib_file in all_bib_files
             if (self.include_source_master or bib_file.name.lower() != "master.bib")
+            and (self.selected_root_files is None or bib_file.name in self.selected_root_files)
             and not self._is_generated_workspace_path(bib_file, root_path)
         ]
         
@@ -535,7 +541,10 @@ class BibliographyManager:
 
         self.embedded_bib_files = []
         embedded_targets: Set[Path] = set()
-        for tex_file in sorted(Path(self.root_directory).rglob("*.tex")):
+        tex_files = source_root.glob("*.tex") if self.root_files_only else source_root.rglob("*.tex")
+        for tex_file in sorted(tex_files):
+            if self.selected_root_files is not None and tex_file.name not in self.selected_root_files:
+                continue
             if self._is_generated_workspace_path(tex_file, root_path):
                 continue
             try:
@@ -1207,7 +1216,7 @@ class BibliographyManager:
     def create_processed_copy(self) -> Path:
         """Create an Overleaf-ready copy without changing any source files."""
         source_root = Path(self.root_directory).resolve()
-        output_name = "processed"
+        output_name = self.output_name
         output_root = source_root / output_name
         if output_root.exists():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1219,10 +1228,18 @@ class BibliographyManager:
                 suffix += 1
 
         def ignore_generated(directory: str, names: List[str]) -> Set[str]:
-            return {
+            ignored = {
                 name for name in names
                 if name.startswith(("backup_", "processed_")) or name in {".git", "processed"}
             }
+            if self.root_files_only and Path(directory) == source_root:
+                ignored.update(
+                    name for name in names
+                    if not (source_root / name).is_file()
+                    or Path(name).suffix.lower() not in {".tex", ".bib"}
+                    or self.selected_root_files is not None and name not in self.selected_root_files
+                )
+            return ignored
 
         original_root = self.root_directory
         try:
@@ -1323,19 +1340,24 @@ class BibliographyManager:
         # Update report_data
         self.report_data['file_changes'] = file_changes
 
-    def _replace_citation_keys_in_tex(self, text: str, mapping: Dict[str, str]) -> Tuple[str, int]:
+    def _replace_citation_keys_in_tex(
+        self, text: str, mapping: Dict[str, str], changed_spans: List[Tuple[int, int]] | None = None
+    ) -> Tuple[str, int]:
         """Replace keys inside LaTeX cite-like commands while preserving options and spacing."""
         cite_pattern = re.compile(r'\\([A-Za-z]*cite[A-Za-z*]*)(\s*(?:\[[^\]]*\]\s*)*)\{([^}]*)\}')
         replacements = 0
+        output_offset = 0
 
         def _replace_in_code_segment(segment: str) -> str:
             nonlocal replacements
+            length_delta = 0
 
             def _command_replacer(match):
-                nonlocal replacements
+                nonlocal replacements, length_delta
                 command = match.group(1)
                 opts = match.group(2)
                 key_blob = match.group(3)
+                previous_replacements = replacements
 
                 updated_parts: List[str] = []
                 for part in key_blob.split(','):
@@ -1356,7 +1378,12 @@ class BibliographyManager:
                         updated_parts.append(part)
 
                 updated_blob = ','.join(updated_parts)
-                return f"\\{command}{opts}{{{updated_blob}}}"
+                result = f"\\{command}{opts}{{{updated_blob}}}"
+                if changed_spans is not None and replacements > previous_replacements:
+                    start = output_offset + match.start() + length_delta
+                    changed_spans.append((start, start + len(result)))
+                length_delta += len(result) - len(match.group(0))
+                return result
 
             return cite_pattern.sub(_command_replacer, segment)
 
@@ -1365,6 +1392,7 @@ class BibliographyManager:
             # Preserve full-line comments untouched.
             if re.match(r'^\s*%', line):
                 updated_lines.append(line)
+                output_offset += len(line)
                 continue
 
             # Split at first unescaped '%' so trailing comments remain untouched.
@@ -1382,9 +1410,11 @@ class BibliographyManager:
             if split_at >= 0:
                 code_part = line[:split_at]
                 comment_part = line[split_at:]
-                updated_lines.append(_replace_in_code_segment(code_part) + comment_part)
+                updated_line = _replace_in_code_segment(code_part) + comment_part
             else:
-                updated_lines.append(_replace_in_code_segment(line))
+                updated_line = _replace_in_code_segment(line)
+            updated_lines.append(updated_line)
+            output_offset += len(updated_line)
 
         return ''.join(updated_lines), replacements
 
@@ -1393,6 +1423,8 @@ class BibliographyManager:
         file_changes: Dict[str, Dict] = self.report_data.get('file_changes', {})
         tex_files_updated = 0
         tex_citation_updates = 0
+        citation_spans = {}
+        citation_hashes = {}
         root_path = Path(self.root_directory).resolve()
 
         for tex_file in Path(self.root_directory).rglob('*.tex'):
@@ -1406,12 +1438,20 @@ class BibliographyManager:
                 parts = []
                 last = 0
                 replaced_count = 0
+                output_offset = 0
+                file_spans = []
                 for _, start, end in _embedded_bib_blocks(original_text):
-                    updated, count = self._replace_citation_keys_in_tex(original_text[last:start], mapping)
-                    parts.extend((updated, _rewrite_bib_keys(original_text[start:end], mapping)))
+                    spans = []
+                    updated, count = self._replace_citation_keys_in_tex(original_text[last:start], mapping, spans)
+                    file_spans.extend((output_offset + first, output_offset + last_pos) for first, last_pos in spans)
+                    embedded = _rewrite_bib_keys(original_text[start:end], mapping)
+                    parts.extend((updated, embedded))
+                    output_offset += len(updated) + len(embedded)
                     replaced_count += count
                     last = end
-                updated, count = self._replace_citation_keys_in_tex(original_text[last:], mapping)
+                spans = []
+                updated, count = self._replace_citation_keys_in_tex(original_text[last:], mapping, spans)
+                file_spans.extend((output_offset + first, output_offset + last_pos) for first, last_pos in spans)
                 parts.append(updated)
                 replaced_count += count
                 updated_text = ''.join(parts)
@@ -1422,7 +1462,11 @@ class BibliographyManager:
                 relpath = str(tex_file.relative_to(self.root_directory))
                 file_changes[relpath] = {
                     'changed_lines': changed_lines,
+                    'original_hash': hashlib.sha256(original_text.encode('utf-8')).hexdigest(),
+                    'updated_hash': hashlib.sha256(updated_text.encode('utf-8')).hexdigest(),
                 }
+                citation_spans[relpath] = file_spans
+                citation_hashes[relpath] = hashlib.sha256(updated_text.encode('utf-8')).hexdigest()
 
                 with open(tex_file, 'w', encoding='utf-8') as f:
                     f.write(updated_text)
@@ -1435,6 +1479,8 @@ class BibliographyManager:
         self.report_data['file_changes'] = file_changes
         self.report_data['tex_files_updated'] = tex_files_updated
         self.report_data['tex_citation_updates'] = tex_citation_updates
+        self.report_data['tex_citation_spans'] = citation_spans
+        self.report_data['tex_citation_hashes'] = citation_hashes
 
     def update_source_citations(self):
         """Rewrite source BibTeX keys and LaTeX citations after key normalization."""
@@ -1460,6 +1506,8 @@ class BibliographyManager:
                     relpath = str(bib_file.relative_to(self.root_directory))
                     file_changes[relpath] = {
                         'changed_lines': self._compute_changed_lines(original_text, updated_text),
+                        'original_hash': hashlib.sha256(original_text.encode('utf-8')).hexdigest(),
+                        'updated_hash': hashlib.sha256(updated_text.encode('utf-8')).hexdigest(),
                     }
             except OSError as error:
                 raise OSError(f"Could not update bibliography keys in {bib_file}") from error

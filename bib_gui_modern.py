@@ -9,6 +9,7 @@ import ctypes
 import threading
 import webbrowser
 import difflib
+import hashlib
 import re
 from contextlib import ExitStack
 from collections import Counter
@@ -16,9 +17,8 @@ from pathlib import Path
 import tarfile
 from typing import Optional
 from bib import BibliographyManager, LARGE_BIB_PARSE_THRESHOLD
-from project_batch import discover_projects, process_projects, validate_project_roots
-import importlib
-from typing import TYPE_CHECKING, Any
+from project_batch import Project, RootFileProject, discover_batch_projects, process_projects, validate_project_roots
+from typing import Any
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -32,10 +32,6 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
 from tkinter import messagebox
-
-if TYPE_CHECKING:
-    # Provide a name for static checkers without importing the runtime module
-    webview: Any  # pragma: no cover
 
 # Set appearance mode and color theme
 ctk.set_appearance_mode("system")
@@ -116,6 +112,32 @@ def _collect_tex_documents(root: Path) -> dict[str, str]:
     }
 
 
+_DOCUMENT_TEXT_SUFFIXES = {
+    ".tex", ".bib", ".txt", ".md", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".sty", ".cls", ".cfg", ".bst", ".bbl", ".ini", ".log", ".xml", ".html", ".htm",
+}
+
+
+def _collect_project_documents(root: Path, snapshot: bool = False) -> dict[str, Path | bytes]:
+    """List supported text files, excluding generated subfolders."""
+    documents = {}
+
+    def scan_error(error: OSError) -> None:
+        raise error
+
+    for directory, names, files in os.walk(root, followlinks=False, onerror=scan_error):
+        names[:] = sorted(
+            name for name in names
+            if not (Path(directory) / name).is_symlink()
+            and not BibliographyManager._is_generated_workspace_path(Path(directory) / name, root)
+        )
+        for name in sorted(files):
+            path = Path(directory) / name
+            if path.suffix.lower() in _DOCUMENT_TEXT_SUFFIXES and path.is_file() and not path.is_symlink():
+                documents[str(path.relative_to(root))] = path.read_bytes() if snapshot else path
+    return documents
+
+
 def _large_preview_source(root: Path) -> bool:
     root = root.resolve()
     total = 0
@@ -179,6 +201,11 @@ class ModernBibGUI:
         self._tex_documents = {}
         self._document_report_data = {}
         self._batch_document_projects = {}
+        self._batch_result_projects = {}
+        self._batch_result_selection = None
+        self._batch_library_states = {}
+        self._pending_library_refresh = False
+        self._pending_fixes_refresh = False
         self._tex_citation_spans = []
         self._current_tex_citation_idx = -1
         self._key_review_event = None
@@ -186,7 +213,12 @@ class ModernBibGUI:
         self._key_review_items = []
         self._batch_key_review_items = None
         self._batch_review_active = False
+        self._batch_review_waiting = False
         self._batch_active = False
+        self._pending_batch_projects = None
+        self._batch_review_results = []
+        self._batch_reviewed_projects = set()
+        self._key_review_page = 0
         self._key_review_push_back = True
         self._show_unchanged_var = ctk.BooleanVar(value=True)
         self._diff_context_lines = 2
@@ -225,6 +257,7 @@ class ModernBibGUI:
         self._current_duplicate_display_name = "-"
         self._library_entries = []
         self._library_filtered_entries = []
+        self._library_page = 0
         self._library_scope = "All References"
         self._library_scope_buttons = {}
         self._library_left_mode = None
@@ -893,6 +926,8 @@ class ModernBibGUI:
             textvariable=self._status_text,
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#6ab8ff",
+            wraplength=250,
+            justify="left",
         )
         self.status_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 10))
 
@@ -1005,6 +1040,8 @@ class ModernBibGUI:
             corner_radius=8,
             padx=10,
             pady=6,
+            wraplength=250,
+            justify="left",
         )
         self.top_status_badge.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 8), pady=8)
 
@@ -1053,6 +1090,16 @@ class ModernBibGUI:
         )
         self.header_hint_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 8))
 
+        self.result_project_frame = ctk.CTkFrame(header, fg_color="transparent")
+        self.result_project_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 8))
+        ctk.CTkLabel(self.result_project_frame, text="Result project:").pack(side="left", padx=(0, 8))
+        self.result_project_menu = ctk.CTkOptionMenu(
+            self.result_project_frame, values=["No completed projects"], command=self._select_batch_result,
+            state="disabled",
+        )
+        self.result_project_menu.pack(side="left", fill="x", expand=True)
+        self.result_project_frame.grid_remove()
+
         self.tabview = ctk.CTkTabview(main_frame, corner_radius=10)
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         
@@ -1090,6 +1137,12 @@ class ModernBibGUI:
         # Defer heavy render slightly so the tab switch paints first.
         if tab_name == "🔍 Duplicates" and self._pending_duplicates_refresh:
             self.root.after(20, self._refresh_pending_duplicates)
+        elif tab_name == "📚 Library" and self._pending_library_refresh:
+            self._pending_library_refresh = False
+            self.root.after(20, self._load_library_entries)
+        elif tab_name == "🛠 Fixes" and self._pending_fixes_refresh:
+            self._pending_fixes_refresh = False
+            self.root.after(20, self._load_fix_files)
 
     def _refresh_pending_duplicates(self):
         """Render duplicates only when needed and only on the Duplicates tab."""
@@ -1155,6 +1208,11 @@ class ModernBibGUI:
 
         actions = ctk.CTkFrame(header, fg_color="transparent")
         actions.grid(row=0, column=1, sticky="e", padx=16, pady=12)
+        self.key_review_mark_btn = ctk.CTkButton(
+            actions, text="Mark project reviewed", command=self._mark_batch_project_reviewed,
+            state="disabled", height=36,
+        )
+        self.key_review_mark_btn.grid(row=0, column=0, padx=(0, 8))
         self.key_review_confirm_btn = ctk.CTkButton(
             actions,
             text="Create processed copy",
@@ -1163,7 +1221,7 @@ class ModernBibGUI:
             height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.key_review_confirm_btn.grid(row=0, column=0, padx=(0, 8))
+        self.key_review_confirm_btn.grid(row=0, column=1, padx=(0, 8))
         self.key_review_cancel_btn = ctk.CTkButton(
             actions,
             text="Cancel review",
@@ -1171,7 +1229,24 @@ class ModernBibGUI:
             state="disabled",
             height=36,
         )
-        self.key_review_cancel_btn.grid(row=0, column=1)
+        self.key_review_cancel_btn.grid(row=0, column=2)
+
+        self.key_review_project_menu = ctk.CTkOptionMenu(
+            header, values=["No projects"], command=self._select_batch_key_review,
+            state="disabled", width=400,
+        )
+        self.key_review_project_menu.grid(row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+        self.key_review_project_menu.grid_remove()
+        self.key_review_progress = ctk.CTkProgressBar(header)
+        self.key_review_progress.grid(row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+        self.key_review_progress.set(0)
+        self.key_review_progress.grid_remove()
+        self.key_review_single_btn = ctk.CTkButton(
+            header, text="Treat this folder as one project",
+            command=lambda: self._run_pipeline(treat_as_single=True), height=32,
+        )
+        self.key_review_single_btn.grid(row=6, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 12))
+        self.key_review_single_btn.grid_remove()
 
         table_frame = ctk.CTkFrame(tab, corner_radius=10)
         table_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -1184,7 +1259,7 @@ class ModernBibGUI:
         toolbar.grid_columnconfigure(0, weight=1)
         self.key_review_toolbar = toolbar
         self.key_review_search_var = ctk.StringVar(value="")
-        self.key_review_search_var.trace_add("write", lambda *_args: self._filter_key_review())
+        self.key_review_search_var.trace_add("write", lambda *_args: self._reset_key_review_page())
         self.key_review_search_entry = ctk.CTkEntry(
             toolbar,
             textvariable=self.key_review_search_var,
@@ -1194,6 +1269,14 @@ class ModernBibGUI:
         self.key_review_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 12))
         self.key_review_count_label = ctk.CTkLabel(toolbar, text="0 changes", font=ctk.CTkFont(size=11))
         self.key_review_count_label.grid(row=0, column=1, sticky="e")
+        self.key_review_prev_btn = ctk.CTkButton(
+            toolbar, text="Previous", width=70, command=lambda: self._change_key_review_page(-1)
+        )
+        self.key_review_prev_btn.grid(row=0, column=2, padx=(8, 4))
+        self.key_review_next_btn = ctk.CTkButton(
+            toolbar, text="Next", width=70, command=lambda: self._change_key_review_page(1)
+        )
+        self.key_review_next_btn.grid(row=0, column=3)
 
         tree_host = ctk.CTkFrame(table_frame, corner_radius=8)
         tree_host.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -1225,6 +1308,14 @@ class ModernBibGUI:
         review_x_scrollbar.grid(row=2, column=0, sticky="ew")
         self.key_review_tree.configure(xscrollcommand=review_x_scrollbar.set)
 
+    def _reset_key_review_page(self):
+        self._key_review_page = 0
+        self._filter_key_review()
+
+    def _change_key_review_page(self, direction: int):
+        self._key_review_page = max(0, self._key_review_page + direction)
+        self._filter_key_review()
+
     def _filter_key_review(self):
         """Render the review table using the current key filter."""
         if not hasattr(self, "key_review_tree") or getattr(self, "_key_review_loading", False):
@@ -1237,15 +1328,25 @@ class ModernBibGUI:
             row for row in items
             if not query or any(query in value.casefold() for value in row)
         ]
-        for row in matches:
+        page_size = 500
+        self._key_review_page = min(getattr(self, "_key_review_page", 0), max(0, (len(matches) - 1) // page_size))
+        start = self._key_review_page * page_size
+        for row in matches[start:start + page_size]:
             self.key_review_tree.insert("", "end", values=row if batch_items is not None else ("", *row))
         total = len(items)
+        if hasattr(self, "key_review_prev_btn"):
+            self.key_review_prev_btn.configure(state="normal" if start else "disabled")
+            self.key_review_next_btn.configure(state="normal" if start + page_size < len(matches) else "disabled")
         if batch_items is not None:
-            self.key_review_count_label.configure(text=f"{len(matches)} of {total} rows")
+            first = start + 1 if matches else 0
+            last = min(start + page_size, len(matches))
+            self.key_review_count_label.configure(text=f"{first}-{last} of {len(matches)} ({total} total)")
             return
         self.key_review_count_label.configure(
-            text=f"{len(matches)} of {total} change{'s' if total != 1 else ''}"
-            if query else f"{total} change{'s' if total != 1 else ''}"
+            text=(f"{start + 1 if matches else 0}-{min(start + page_size, len(matches))} of {len(matches)} matches"
+                  if len(matches) > page_size else
+                  f"{len(matches)} of {total} change{'s' if total != 1 else ''}"
+                  if query else f"{total} change{'s' if total != 1 else ''}")
         )
 
     def _show_key_review(self):
@@ -1254,6 +1355,11 @@ class ModernBibGUI:
             return
         self._batch_review_active = False
         self._batch_key_review_items = None
+        if hasattr(self, "key_review_project_menu"):
+            self.key_review_project_menu.grid_remove()
+            self.key_review_mark_btn.configure(state="disabled")
+            self.key_review_progress.grid_remove()
+            self.key_review_single_btn.grid_remove()
         self.key_review_tree.configure(displaycolumns=("current", "proposed"))
         raw_mappings = self.manager.report_data.get("keys_changed", []) or []
         self._key_review_items = [
@@ -1264,7 +1370,7 @@ class ModernBibGUI:
         self._key_review_loading = True
         self.key_review_search_var.set("")
         self._key_review_loading = False
-        self._filter_key_review()
+        self._reset_key_review_page()
         mode = (
             "The original project remains unchanged. Confirm to create a processed copy with these keys and updated citations."
             if self._key_review_push_back
@@ -1295,43 +1401,85 @@ class ModernBibGUI:
 
     def _show_batch_key_review(self, results: list[dict]):
         self._batch_review_active = True
-        rows = []
-        for result in results:
-            project = str(result["project"])
-            if result["status"] != "ready":
-                rows.append((project, result["status"].upper(), result["detail"]))
-                continue
-            report = result["manager"].report_data
-            rows.extend(
-                (project, str(item["Original Raw Key"]), str(item["Normalized Key"]))
-                for item in report.get("key_audit", [])
-            )
-            rows.extend(
-                (project, str(entry.get("ID", "")), "Merged duplicate (not in master)")
-                for group in report.get("duplicate_groups", [])
-                for entry in group.get("entries", [])
-                if entry.get("_status") == "removed"
-            )
-        self._batch_key_review_items = rows
+        self._batch_review_waiting = True
+        self._batch_review_results = results
+        self._batch_reviewed_projects = set()
+        projects = [str(result["project"]) for result in results]
+        self.key_review_project_menu.configure(values=projects, state="normal")
+        self.key_review_project_menu.grid()
+        self.key_review_project_menu.set(projects[0])
         self.key_review_tree.configure(displaycolumns=("project", "current", "proposed"))
+        self.key_review_confirm_btn.configure(text="Process reviewed projects", state="disabled")
+        self.key_review_cancel_btn.configure(state="normal")
+        self.key_review_progress.set(1)
+        self._set_status("Analysis complete; review each project", "#3b8ed0")
+        self._select_batch_key_review(projects[0])
+        self.tabview.set("🔑 Key Review")
+
+    def _select_batch_key_review(self, selection: str):
+        result = next((item for item in self._batch_review_results if str(item["project"]) == selection), None)
+        if result is None:
+            self._log_message(f"Unknown project selected for key review: {selection}")
+            return
+        rows = []
+        if result.get("manager") is not None:
+            report = result["manager"].report_data
+            rows.extend((selection, str(item["Original Raw Key"]), str(item["Normalized Key"]))
+                        for item in report.get("key_audit", []))
+            rows.extend((selection, str(entry.get("ID", "")), "Merged duplicate (not in master)")
+                        for group in report.get("duplicate_groups", [])
+                        for entry in group.get("entries", []) if entry.get("_status") == "removed")
+        else:
+            rows.append((selection, result["status"].upper(), result["detail"]))
+        self._batch_key_review_items = rows
         self._key_review_loading = True
         self.key_review_search_var.set("")
         self._key_review_loading = False
-        self._filter_key_review()
-        counts = Counter(result["status"] for result in results)
-        self.key_review_project_label.configure(text="Review all projects")
-        self.key_review_path_label.configure(text="Search by project path, current key, or proposed key.")
-        self.key_review_status_label.configure(
-            text=(f"{counts['ready']} ready, {counts['error']} failed, {counts['skipped']} skipped. "
-                  "Review all keys, including unchanged and merged duplicate keys. "
-                  "Confirm once to create copies for the ready projects; originals remain unchanged.")
+        self._reset_key_review_page()
+        ready = [item for item in self._batch_review_results if item["status"] == "ready"]
+        counts = Counter(item["status"] for item in self._batch_review_results)
+        reviewed = selection in self._batch_reviewed_projects
+        self.key_review_project_label.configure(text=f"Reviewing: {Path(selection).name or selection}")
+        self.key_review_path_label.configure(text=f"Location: {selection}")
+        if self._batch_review_waiting:
+            scope = (" This group includes only its listed root-level .tex and .bib files."
+                     if result["status"] == "ready" and result["manager"].root_files_only else "")
+            self.key_review_status_label.configure(
+                text=(f"{len(self._batch_reviewed_projects)} of {len(ready)} ready projects reviewed; "
+                      f"{counts['error']} failed, {counts['skipped']} skipped. "
+                      "Review all pages, including unchanged and merged keys, then mark the project reviewed."
+                      + scope)
+            )
+        self.key_review_mark_btn.configure(
+            text="Reviewed" if reviewed else "Mark project reviewed",
+            state="normal" if self._batch_review_waiting and result["status"] == "ready" and not reviewed else "disabled",
         )
-        self.key_review_confirm_btn.configure(text="Create ready project copies", state="normal")
-        self.key_review_cancel_btn.configure(state="normal")
-        self.tabview.set("🔑 Key Review")
+        self.key_review_confirm_btn.configure(state="normal" if self._batch_review_waiting and ready and len(self._batch_reviewed_projects) == len(ready) else "disabled")
+
+    def _mark_batch_project_reviewed(self):
+        if not self._batch_review_waiting:
+            return
+        selection = self.key_review_project_menu.get()
+        result = next((item for item in self._batch_review_results if str(item["project"]) == selection), None)
+        if result is None or result["status"] != "ready":
+            return
+        self._batch_reviewed_projects.add(selection)
+        next_project = next((str(item["project"]) for item in self._batch_review_results
+                             if item["status"] == "ready" and str(item["project"]) not in self._batch_reviewed_projects), selection)
+        self.key_review_project_menu.set(next_project)
+        self._select_batch_key_review(next_project)
 
     def _approve_key_review(self):
         """Allow the worker to write the reviewed output."""
+        projects = getattr(self, "_pending_batch_projects", None)
+        if projects is not None:
+            self._pending_batch_projects = None
+            if Path(self.dir_entry.get().strip()).resolve() != self._batch_inventory_source:
+                self.key_review_confirm_btn.configure(state="disabled")
+                messagebox.showwarning("Source changed", "Select Analyze & Review again to rediscover projects.", parent=self.root)
+                return
+            self._start_batch(projects)
+            return
         self._key_review_approved = True
         if self._key_review_event is not None:
             self._key_review_event.set()
@@ -1340,6 +1488,12 @@ class ModernBibGUI:
         self._apply_pipeline_snapshot()
         self.key_review_confirm_btn.configure(state="disabled", text="Creating output...")
         self.key_review_cancel_btn.configure(state="disabled")
+        if getattr(self, "_batch_review_active", False):
+            self._batch_review_waiting = False
+            self.key_review_mark_btn.configure(state="disabled")
+            self.key_review_progress.grid()
+            self.key_review_progress.set(0)
+        self.tabview.set("📋 Pipeline")
         self.key_review_status_label.configure(
             text="Creating processed copies from the reviewed mappings..."
             if getattr(self, "_batch_review_active", False)
@@ -1359,12 +1513,15 @@ class ModernBibGUI:
 
     def _cancel_key_review(self):
         """Cancel the paused pipeline before it creates any output."""
+        self._pending_batch_projects = None
+        self._batch_review_waiting = False
         self._key_review_approved = False
         self.processing = False
         if self._key_review_event is not None:
             self._key_review_event.set()
         self.key_review_confirm_btn.configure(state="disabled", text="Review cancelled")
         self.key_review_cancel_btn.configure(state="disabled")
+        self.key_review_single_btn.grid_remove()
         message = "Review cancelled. No processed output was created."
         self.key_review_status_label.configure(text=message)
         self._log_message(message)
@@ -1588,6 +1745,14 @@ class ModernBibGUI:
             button_color=neutral_btn_hover,
         )
         self.library_density_menu.grid(row=0, column=3)
+        self.library_prev_btn = ctk.CTkButton(
+            toolbar, text="Previous", width=70, height=control_h, command=lambda: self._change_library_page(-1)
+        )
+        self.library_prev_btn.grid(row=0, column=4, padx=(8, 4))
+        self.library_next_btn = ctk.CTkButton(
+            toolbar, text="Next", width=60, height=control_h, command=lambda: self._change_library_page(1)
+        )
+        self.library_next_btn.grid(row=0, column=5)
 
         self.library_delete_btn.configure(fg_color=neutral_btn, hover_color=neutral_btn_hover)
         self.library_export_btn.configure(fg_color=neutral_btn, hover_color=neutral_btn_hover)
@@ -2468,6 +2633,7 @@ class ModernBibGUI:
         self._apply_library_filter()
 
     def _apply_library_filter(self):
+        self._library_page = 0
         entries = list(self._library_entries)
         duplicate_keys = set()
         if self.manager:
@@ -2513,16 +2679,27 @@ class ModernBibGUI:
         self._library_filtered_entries = entries
         self._refresh_library_tree()
 
+    def _change_library_page(self, direction: int):
+        self._library_page = max(0, getattr(self, "_library_page", 0) + direction)
+        self._refresh_library_tree()
+
     def _refresh_library_tree(self):
         if not hasattr(self, 'library_tree'):
             return
         selected_key = self._selected_library_key
 
+        total_matches = len(self._library_filtered_entries)
+        page_size = 500
+        self._library_page = min(getattr(self, "_library_page", 0), max(0, (total_matches - 1) // page_size))
+        start = self._library_page * page_size
+        end = min(start + page_size, total_matches)
         if hasattr(self, 'library_count_badge'):
-            shown = len(self._library_filtered_entries)
             total = len(self._library_entries)
-            badge_text = f"{shown}/{total} refs" if total else "0 refs"
+            badge_text = f"{start + 1 if total_matches else 0}-{end} of {total_matches}/{total} refs" if total else "0 refs"
             self.library_count_badge.configure(text=badge_text)
+        if hasattr(self, "library_prev_btn"):
+            self.library_prev_btn.configure(state="normal" if start else "disabled")
+            self.library_next_btn.configure(state="normal" if end < total_matches else "disabled")
 
         for item in self.library_tree.get_children():
             self.library_tree.delete(item)
@@ -2534,7 +2711,8 @@ class ModernBibGUI:
             if str(item.get('ID', '')).strip()
         }
 
-        for idx, entry in enumerate(self._library_filtered_entries):
+        for idx in range(start, end):
+            entry = self._library_filtered_entries[idx]
             is_favorite = bool(entry.get('_favorite'))
             is_duplicate = str(entry.get('ID', '')).strip() in duplicate_key_set
             missing_core = not str(entry.get('author', '')).strip() or not str(entry.get('title', '')).strip() or not str(entry.get('year', '')).strip()
@@ -2558,6 +2736,7 @@ class ModernBibGUI:
         selected_index = next(
             (
                 idx for idx, entry in enumerate(self._library_filtered_entries)
+                if start <= idx < end
                 if selected_key and str(entry.get("ID", "")).strip() == selected_key
             ),
             None,
@@ -2782,6 +2961,8 @@ class ModernBibGUI:
                               text="Waiting to start...",
                               font=ctk.CTkFont(size=10),
                               text_color="#d1d5db",
+                              wraplength=600,
+                              justify="left",
                               anchor="w")
         self.current_step_label.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=6)
 
@@ -2836,6 +3017,10 @@ class ModernBibGUI:
             text_color="#94a3b8",
         )
         self.results_scope_label.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.copy_results_btn = ctk.CTkButton(
+            self.results_hero_frame, text="Copy output paths", width=140, command=self._copy_result_paths
+        )
+        self.copy_results_btn.grid(row=0, column=2, rowspan=2, padx=(12, 0), sticky="e")
 
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -2950,11 +3135,22 @@ class ModernBibGUI:
         self.results_folders_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.results_folders_box.insert("1.0", "Folder impact will appear here after a run.")
 
+        self.batch_results_frame = ctk.CTkFrame(scroll, corner_radius=8)
+        self.batch_results_frame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        ctk.CTkLabel(
+            self.batch_results_frame, text="Batch project results", font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(fill="x", padx=12, pady=(12, 8))
+        self.batch_results_box = ctk.CTkTextbox(
+            self.batch_results_frame, font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=180
+        )
+        self.batch_results_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.batch_results_frame.grid_remove()
+
     def _build_fixes_tab(self):
         """Build fixes tab with a single inline IDE-style diff viewer."""
         tab = self.tabview.tab("🛠 Fixes")
         self.fixes_tab = tab
-        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=0)
         tab.grid_rowconfigure(1, weight=0)
         tab.grid_rowconfigure(2, weight=1)
         tab.grid_columnconfigure(0, weight=1)
@@ -3027,7 +3223,7 @@ class ModernBibGUI:
         self.fixes_diff_box = self.fixes_diff_text
 
     def _build_documents_tab(self):
-        """Build a read-only viewer for project .tex files after processing."""
+        """Build a read-only viewer for project text files after processing."""
         tab = self.tabview.tab("📄 Documents")
         self.documents_tab = tab
         tab.grid_rowconfigure(1, weight=1)
@@ -3054,16 +3250,16 @@ class ModernBibGUI:
 
         self.document_file_menu = ctk.CTkOptionMenu(
             controls,
-            values=["Run the pipeline to load .tex files"],
+            values=["Run the pipeline to load project files"],
             command=self._show_tex_document,
             state="disabled",
         )
         self.document_file_menu.grid(row=1, column=0, padx=(0, 10), sticky="w")
-        self.document_file_menu.set("Run the pipeline to load .tex files")
+        self.document_file_menu.set("Run the pipeline to load project files")
 
         self.document_info = ctk.CTkLabel(
             controls,
-            text="Choose a LaTeX file to inspect citation keys.",
+            text="Choose a project text file. Citation navigation is available for .tex files.",
             text_color="gray",
             anchor="w",
         )
@@ -3071,8 +3267,8 @@ class ModernBibGUI:
 
         self.document_previous_button = ctk.CTkButton(
             controls,
-            text="Previous",
-            width=78,
+            text="Previous change",
+            width=110,
             command=lambda: self._navigate_tex_citation(-1),
             state="disabled",
         )
@@ -3080,8 +3276,8 @@ class ModernBibGUI:
 
         self.document_next_button = ctk.CTkButton(
             controls,
-            text="Next",
-            width=64,
+            text="Next change",
+            width=95,
             command=lambda: self._navigate_tex_citation(1),
             state="disabled",
         )
@@ -3104,28 +3300,46 @@ class ModernBibGUI:
         self.document_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def _show_tex_document(self, selection: str):
-        """Show the selected processed or source LaTeX document."""
-        content = self._tex_documents.get(selection)
-        if content is None:
+        """Show the selected processed or source text file."""
+        document = self._tex_documents.get(selection)
+        if document is None:
+            return
+
+        try:
+            content = (document.read_text(encoding="utf-8") if isinstance(document, Path)
+                       else document.decode("utf-8") if isinstance(document, bytes) else document)
+        except (OSError, UnicodeError) as error:
+            self.document_text.configure(state="normal")
+            self.document_text.delete("1.0", "end")
+            self.document_text.configure(state="disabled")
+            self._tex_citation_spans = []
+            self._current_tex_citation_idx = -1
+            self._update_tex_citation_navigation()
+            message = f"Could not read {selection} as UTF-8 text: {error}"
+            self.document_info.configure(text=message)
+            self._log_message(f"⚠️ {message}")
             return
 
         self.document_text.configure(state="normal")
         self.document_text.delete("1.0", "end")
         self.document_text.insert("1.0", content)
+        self._current_tex_document = selection
+        self._tex_preview_warning = ""
         self._highlight_tex_citations(content)
         self.document_text.configure(state="disabled")
         report_data = self._document_report_data
         if report_data.get("processed_copy_path"):
             citation_count = report_data.get("tex_citation_updates", 0)
             file_count = report_data.get("tex_files_updated", 0)
-            self.document_info.configure(
-                text=f"{selection} · processed copy · {citation_count} citation(s) updated across {file_count} .tex file(s)"
-            )
+            detail = (f"{citation_count} citation(s) updated across {file_count} .tex file(s)"
+                      if Path(selection).suffix.lower() == ".tex" else "citation navigation is available for .tex files")
+            self.document_info.configure(text=(f"{selection} · processed copy · {detail}"
+                                               + (f" · {self._tex_preview_warning}" if self._tex_preview_warning else "")))
         else:
             self.document_info.configure(text=f"{selection} · source file (unchanged)")
 
     def _highlight_tex_citations(self, content: str):
-        """Highlight all citation commands and select the first for navigation."""
+        """Highlight citations actually rewritten in the processed document."""
         text_widget = self._get_text_widget(self.document_text)
         if text_widget is None:
             return
@@ -3133,8 +3347,15 @@ class ModernBibGUI:
         text_widget.tag_configure("tex_citation", background="#fff0a6", foreground="#111827")
         text_widget.tag_configure("tex_citation_current", background="#93c5fd", foreground="#111827")
         text_widget.tag_raise("tex_citation_current")
-        self._tex_citation_spans = _find_tex_citation_spans(content)
-        self._current_tex_citation_idx = 0 if self._tex_citation_spans else -1
+        report = self._document_report_data
+        selection = self._current_tex_document
+        expected_hash = report.get("tex_citation_hashes", {}).get(selection)
+        if expected_hash and hashlib.sha256(content.encode("utf-8")).hexdigest() != expected_hash:
+            self._tex_preview_warning = "File changed after processing; change locations are unavailable."
+            self._tex_citation_spans = []
+        else:
+            self._tex_citation_spans = report.get("tex_citation_spans", {}).get(selection, [])
+        self._current_tex_citation_idx = -1
 
         for start, end in self._tex_citation_spans:
             text_widget.tag_add(
@@ -3143,7 +3364,10 @@ class ModernBibGUI:
                 f"1.0 + {end} chars",
             )
 
-        self._update_tex_citation_navigation()
+        if self._tex_citation_spans:
+            self._navigate_tex_citation(1)
+        else:
+            self._update_tex_citation_navigation()
 
     def _navigate_tex_citation(self, direction: int):
         """Move the active citation selection, wrapping at either end."""
@@ -3175,14 +3399,14 @@ class ModernBibGUI:
         self.document_previous_button.configure(state=button_state)
         self.document_next_button.configure(state=button_state)
         current = self._current_tex_citation_idx + 1 if has_citations else 0
-        self.document_citation_count.configure(text=f"{current} of {citation_count}")
+        self.document_citation_count.configure(text=f"{current} of {citation_count} changed")
 
     def _load_tex_documents(self, report_data=None):
         """Populate the document picker from the completed pipeline result."""
         if report_data is None:
             report_data = self.manager.report_data if self.manager else {}
         self._document_report_data = report_data
-        documents = report_data.get("tex_documents", {})
+        documents = report_data.get("project_documents", report_data.get("tex_documents", {}))
         self._tex_documents = documents if isinstance(documents, dict) else {}
 
         self.document_text.configure(state="normal")
@@ -3203,13 +3427,14 @@ class ModernBibGUI:
 
         file_names = sorted(self._tex_documents)
         if not file_names:
-            self.document_file_menu.configure(values=["No .tex files found"], state="disabled")
-            self.document_file_menu.set("No .tex files found")
-            self.document_info.configure(text="No LaTeX .tex files were found in this project.")
+            self.document_file_menu.configure(values=["No supported text files found"], state="disabled")
+            self.document_file_menu.set("No supported text files found")
+            self.document_info.configure(text="No supported project text files were found.")
             return
 
         self.document_file_menu.configure(values=file_names, state="normal")
-        self.document_file_menu.set(file_names[0])
+        initial_file = next((name for name in file_names if Path(name).suffix.lower() == ".tex"), file_names[0])
+        self.document_file_menu.set(initial_file)
 
         if report_data.get("processed_copy_path"):
             citation_count = report_data.get("tex_citation_updates", 0)
@@ -3222,7 +3447,7 @@ class ModernBibGUI:
                 text="Showing source files. The processed-copy option was off, so their citation keys were not rewritten."
             )
 
-        self._show_tex_document(file_names[0])
+        self._show_tex_document(initial_file)
 
     def _load_batch_documents(self, results: list[dict]):
         """Make completed processed copies available in the document viewer."""
@@ -3241,7 +3466,23 @@ class ModernBibGUI:
         self.document_project_menu.set(projects[0])
         self._select_batch_document_project(projects[0])
 
-    def _select_batch_document_project(self, selection: str):
+    def _add_batch_document(self, result: dict):
+        if "output" not in result or "manager" not in result:
+            return
+        project = str(result["project"])
+        first = not self._batch_document_projects
+        self._batch_document_projects[project] = (Path(result["output"]), result["manager"].report_data)
+        self.document_project_menu.configure(values=list(self._batch_document_projects), state="normal")
+        self.document_project_frame.grid()
+        if first:
+            self.document_project_menu.set(project)
+            self._select_batch_document_project(project)
+
+    def _select_batch_document_project(self, selection: str, sync_result: bool = True):
+        if (sync_result and selection in getattr(self, "_batch_result_projects", {})
+                and selection != self._batch_result_selection):
+            self._select_batch_result(selection)
+            return
         project = self._batch_document_projects.get(selection)
         if project is None:
             self._log_message(f"⚠️ Unknown project selected for document preview: {selection}")
@@ -3251,12 +3492,49 @@ class ModernBibGUI:
         try:
             if not output.is_dir():
                 raise FileNotFoundError(f"Processed project folder not found: {output}")
-            report["tex_documents"] = _collect_tex_documents(output)
+            report["project_documents"] = _collect_project_documents(output)
             report.pop("tex_preview_error", None)
         except (OSError, UnicodeError) as error:
-            report["tex_preview_error"] = f"Could not load LaTeX documents from {output}: {error}"
+            report["tex_preview_error"] = f"Could not list project text files from {output}: {error}"
             self._log_message(f"⚠️ {report['tex_preview_error']}")
         self._load_tex_documents(report)
+
+    def _select_batch_result(self, selection: str):
+        result = self._batch_result_projects.get(selection)
+        if result is None:
+            self._log_message(f"Unknown completed project selected: {selection}")
+            return
+        previous = self._batch_result_selection
+        if previous == selection:
+            return
+        if previous is not None:
+            self._batch_library_states[previous] = (
+                self._custom_collections, self._library_notes, self._library_tags,
+                self._active_collection_name, self._selected_action_collection, self._library_scope,
+            )
+        state = self._batch_library_states.get(selection, ({}, {}, {}, None, None, "All References"))
+        (self._custom_collections, self._library_notes, self._library_tags,
+         self._active_collection_name, self._selected_action_collection, self._library_scope) = state
+        self._batch_result_selection = selection
+        self.manager = result["manager"]
+        self.result_project_menu.set(selection)
+        self.document_project_menu.set(selection)
+        self.report_path = result.get("report_path")
+        self.view_report_btn.configure(state="normal" if self.report_path and Path(self.report_path).is_file() else "disabled")
+        self._library_entries = []
+        self._library_filtered_entries = []
+        self._clear_library_selection()
+        self._refresh_library_tree()
+        self._pending_library_refresh = True
+        self._pending_duplicates_refresh = True
+        self._pending_fixes_refresh = True
+        self._selected_duplicate_group = 0
+        self._selected_duplicate_file = 0
+        self._update_results()
+        self._select_batch_document_project(selection, sync_result=False)
+        current_tab = self.tabview.get()
+        if current_tab in {"📚 Library", "🔍 Duplicates", "🛠 Fixes"}:
+            self._on_tab_changed(current_tab)
 
     def _reset_tex_document_view(self, message: str):
         """Clear any stale document preview before another pipeline run."""
@@ -3276,7 +3554,7 @@ class ModernBibGUI:
         self.document_text.configure(state="disabled")
         self.document_file_menu.configure(values=[message], state="disabled")
         self.document_file_menu.set(message)
-        self.document_info.configure(text="Choose a LaTeX file to inspect citation keys.")
+        self.document_info.configure(text="Choose a project text file. Citation navigation is available for .tex files.")
 
     def _get_text_widget(self, ctk_textbox):
         """Return underlying tkinter Text widget from CTkTextbox."""
@@ -3707,6 +3985,11 @@ class ModernBibGUI:
         self._log_message(f"ℹ️ Restored last project: {source_path}")
 
     def _select_project_source(self, source_path: str):
+        if getattr(self, "_pending_batch_projects", None) is not None:
+            self._pending_batch_projects = None
+            self.key_review_confirm_btn.configure(state="disabled")
+            self.key_review_cancel_btn.configure(state="disabled")
+            self.key_review_single_btn.grid_remove()
         self._preview_generation += 1
         if not self.processing:
             self.run_btn.configure(state="normal")
@@ -3721,7 +4004,7 @@ class ModernBibGUI:
         selected = Path(selected_path)
         if selected.is_dir():
             try:
-                projects = discover_projects(selected)
+                projects = discover_batch_projects(selected)
             except (OSError, UnicodeError, ValueError) as error:
                 details = f"{type(error).__name__}: {error}"
                 diagnostic = _save_diagnostic(traceback.format_exc())
@@ -3756,16 +4039,16 @@ class ModernBibGUI:
             self.results_folders_box.insert("1.0", "Folder impact will appear here after a run.")
         if hasattr(self, 'fixes_diff_text'):
             self.fixes_diff_text.delete("1.0", "end")
-        self._reset_tex_document_view("Run the pipeline to load .tex files")
+        self._reset_tex_document_view("Run the pipeline to load project files")
         if hasattr(self, 'document_text'):
             self.document_text.configure(state="normal")
             self.document_text.delete("1.0", "end")
             self.document_text.configure(state="disabled")
             self.document_file_menu.configure(
-                values=["Run the pipeline to load .tex files"],
+                values=["Run the pipeline to load project files"],
                 state="disabled",
             )
-            self.document_file_menu.set("Run the pipeline to load .tex files")
+            self.document_file_menu.set("Run the pipeline to load project files")
             self.document_info.configure(text="Choose a LaTeX file to inspect citation keys.")
         self._tex_documents = {}
         self.changed_info.configure(text="")
@@ -3991,6 +4274,12 @@ class ModernBibGUI:
         except Exception:
             return False
 
+    def _copy_result_paths(self):
+        if self._copy_output_paths_to_clipboard():
+            self._set_status("Output paths copied", "#22c55e")
+        else:
+            messagebox.showwarning("Copy output paths", "No output paths are available or the clipboard is unavailable.", parent=self.root)
+
     def _prepare_project_source(self, source_path: str):
         """Resolve a project source into a working directory and optional temp workspace."""
         selected = Path(source_path)
@@ -4021,14 +4310,59 @@ class ModernBibGUI:
 
         raise ValueError(f"Unsupported project source format: {selected.suffix or source_name}")
 
-    def _start_batch(self, projects: list[Path]):
+    def _show_discovered_projects(self, projects: list[Project]):
+        self._pending_batch_projects = projects
+        self._batch_inventory_source = Path(self.dir_entry.get().strip()).resolve()
+        self._batch_review_active = False
+        root_only = isinstance(projects[0], RootFileProject)
+        self._batch_key_review_items = [
+            (str(project), "ROOT FILE GROUP" if isinstance(project, RootFileProject) else "DISCOVERED",
+             "Waiting for analysis")
+            for project in projects
+        ]
+        self.key_review_tree.configure(displaycolumns=("project", "current", "proposed"))
+        self.key_review_project_menu.grid_remove()
+        self.key_review_mark_btn.configure(state="disabled")
+        self.key_review_progress.grid_remove()
+        self._key_review_loading = True
+        self.key_review_search_var.set("")
+        self._key_review_loading = False
+        self._reset_key_review_page()
+        self.key_review_project_label.configure(text=f"{len(projects)} projects found")
+        self.key_review_path_label.configure(text="The detected project locations are listed below.")
+        self.key_review_status_label.configure(
+            text=("Root files are grouped by literal LaTeX links and matching citation keys. "
+                  "Only each group's .tex and .bib files are copied; assets and subfolders are excluded. "
+                  "Choose the single-project option to include subfolders instead. "
+                  if root_only else "")
+                 + "Check the list, then start analysis. No files have been changed."
+        )
+        if root_only:
+            self.key_review_single_btn.grid()
+        else:
+            self.key_review_single_btn.grid_remove()
+        self.key_review_confirm_btn.configure(text="Analyze projects", state="normal")
+        self.key_review_cancel_btn.configure(state="normal")
+        self.tabview.set("🔑 Key Review")
+
+    def _start_batch(self, projects: list[Project]):
         self._clear_for_next_run()
         self.processing = True
         self._batch_active = True
         self._batch_review_active = False
+        self._batch_review_waiting = False
         self._batch_key_review_items = None
+        self._pending_batch_projects = None
         self.manager = None
         self._batch_outputs = []
+        self._batch_live_results = []
+        self._batch_result_projects = {}
+        self._batch_result_selection = None
+        self._batch_library_states = {}
+        self.result_project_frame.grid_remove()
+        self.batch_results_frame.grid()
+        self.batch_results_box.delete("1.0", "end")
+        self.batch_results_box.insert("1.0", "Batch analysis is in progress.")
         self._last_master_path = None
         self._last_cleaned_zip = None
         self.report_path = None
@@ -4041,7 +4375,7 @@ class ModernBibGUI:
         self.view_report_btn.configure(state="disabled")
         self.log_text.delete("1.0", "end")
         self.results_text.delete("1.0", "end")
-        self.results_text.insert("1.0", "Analyzing all projects. Review all keys before creating any processed copies.")
+        self.results_text.insert("1.0", "Analyzing projects. Review each project's keys before processing.")
         self.results_scope_label.configure(text="Multiple projects")
         for label in self.stat_labels.values():
             label.configure(text="—")
@@ -4050,14 +4384,32 @@ class ModernBibGUI:
         self.reduction_text.configure(text="—")
         self.keys_text.configure(text="—")
         self._pending_duplicates_refresh = False
+        self._pending_library_refresh = False
+        self._pending_fixes_refresh = False
+        self._step_state = {name: "pending" for name in self.step_cards}
+        self.step_timers = {name: 0.0 for name in self.step_cards}
+        self._pending_step_text = "Starting batch analysis..."
+        self._apply_pipeline_snapshot()
+        self.key_review_project_menu.grid_remove()
+        self.key_review_mark_btn.configure(state="disabled")
+        self.key_review_single_btn.grid_remove()
+        self.key_review_confirm_btn.configure(state="disabled", text="Analyzing...")
+        self.key_review_cancel_btn.configure(state="normal")
+        self.key_review_progress.set(0)
+        self.key_review_progress.grid()
+        self.key_review_project_label.configure(text=f"Analyzing {len(projects)} projects")
+        self.key_review_status_label.configure(text="Starting analysis...")
+        self.key_review_tree.delete(*self.key_review_tree.get_children())
+        self.key_review_count_label.configure(text="0 rows")
         self._set_status("Analyzing projects...", "#f59e0b")
+        self.tabview.set("📋 Pipeline")
         threshold = float(self.threshold_var.get())
         generate_report = bool(self.report_var.get())
         threading.Thread(
             target=self._batch_worker, args=(projects, threshold, generate_report), daemon=True
         ).start()
 
-    def _batch_worker(self, projects: list[Path], threshold: float, generate_report: bool):
+    def _batch_worker(self, projects: list[Project], threshold: float, generate_report: bool):
         def review(analysis_results: list[dict]) -> bool:
             event = threading.Event()
             self._key_review_event = event
@@ -4088,7 +4440,9 @@ class ModernBibGUI:
         results = []
         try:
             results = process_projects(
-                projects, threshold, generate_report, review, lambda: not self.processing, self._log_message
+                projects, threshold, generate_report, review, lambda: not self.processing, self._log_message,
+                lambda stage, index, total, project, result:
+                    self._ui_call(self._update_batch_progress, stage, index, total, project, result),
             )
         except Exception as error:
             self._log_message(f"Batch failed: {type(error).__name__}: {error}")
@@ -4104,15 +4458,81 @@ class ModernBibGUI:
             self.processing = False
             self._ui_call(self._finish_batch, results)
 
+    def _update_batch_progress(self, stage: str, index: int, total: int, project: Project, result: dict | None):
+        phase = "Processing" if stage in {"Creating processed copy", "Project finished"} else "Analyzing"
+        completed = index if stage in {"Project finished", "Analysis complete", "Analysis failed", "Analysis skipped"} else index - 1
+        text = f"{phase} project {index} of {total}: {project.name} — {stage}"
+        self.key_review_progress.set(completed / total)
+        self._set_status(f"{phase} project {index} of {total}", "#3b8ed0")
+        stages = {
+            "Reading sources": ("Crawl", None),
+            "Finding duplicates": ("Duplicates", "Crawl"),
+            "Removing duplicates": ("Remove", "Duplicates"),
+            "Normalizing citation keys": ("Keys", "Remove"),
+            "Analysis complete": (None, "Keys"),
+        }
+        if stage == "Reading sources":
+            self._step_state = {name: "pending" for name in self.step_cards}
+            self.step_timers = {name: 0.0 for name in self.step_cards}
+        if stage in stages:
+            running, completed_step = stages[stage]
+            if completed_step:
+                self._mark_step_complete(completed_step)
+            if running:
+                self._mark_step_running(running, text)
+            else:
+                self._pending_step_text = text
+                self._apply_pipeline_snapshot()
+        elif stage == "Analysis failed":
+            active = next((name for name, state in self._step_state.items() if state == "running"), None)
+            if active:
+                self._mark_step_error(active, text)
+        elif stage == "Analysis skipped":
+            self._mark_step_complete("Crawl")
+            self._pending_step_text = text
+            self._apply_pipeline_snapshot()
+        else:
+            self._pending_step_text = text
+            self._apply_pipeline_snapshot()
+        if self._batch_document_projects or result is not None and "output" in result:
+            text += "  Open Documents to review completed copies."
+        self.key_review_status_label.configure(text=text)
+        if result is not None:
+            self._add_batch_document(result)
+            self._batch_live_results.append(result)
+            if "output" in result and "manager" in result:
+                selection = str(result["project"])
+                first = not self._batch_result_projects
+                self._batch_result_projects[selection] = result
+                self.result_project_menu.configure(values=list(self._batch_result_projects), state="normal")
+                self.result_project_frame.grid()
+                if first:
+                    self.tabview.set("📈 Dashboard")
+                    self._select_batch_result(selection)
+            if result["status"] == "success":
+                self._batch_outputs.append(result["detail"])
+            summary = "\n\n".join(f"{r['status'].upper()}: {r['project']}\n{r['detail']}"
+                                    for r in self._batch_live_results)
+            self.batch_results_box.delete("1.0", "end")
+            self.batch_results_box.insert("1.0", "Batch in progress. Finished projects:\n\n" + summary)
+            self._log_message(f"{result['status'].upper()}: {project} — {result['detail']}")
+
     def _finish_batch(self, results: list[dict]):
         self._batch_active = False
         self._batch_review_active = False
+        self._batch_review_waiting = False
         self.run_btn.configure(state="normal")
         for widget in (self.browse_btn, self.source_file_btn, self.demo_btn, self.clear_btn, self.dir_entry):
             widget.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
-        self.key_review_confirm_btn.configure(state="disabled")
+        self.key_review_confirm_btn.configure(state="disabled", text="Batch finished")
         self.key_review_cancel_btn.configure(state="disabled")
+        self.key_review_mark_btn.configure(state="disabled")
+        cancelled = any(r["detail"] in {"Batch cancelled", "Review cancelled"} for r in results)
+        if cancelled:
+            self.key_review_confirm_btn.configure(text="Batch cancelled")
+        if results and not cancelled:
+            self.key_review_progress.set(1)
         self._batch_outputs = [result["detail"] for result in results if result["status"] == "success"]
         counts = Counter(result["status"] for result in results)
         summary = (
@@ -4120,24 +4540,33 @@ class ModernBibGUI:
             f"{counts['error']} failed.\n\n"
             + "\n\n".join(f"{r['status'].upper()}: {r['project']}\n{r['detail']}" for r in results)
         )
-        self.results_text.delete("1.0", "end")
-        self.results_text.insert("1.0", summary)
-        self.key_review_status_label.configure(text="Batch finished. See Dashboard for per-project results.")
-        self.manager = None
-        self._load_batch_documents(results)
-        self.tabview.set("📈 Dashboard")
-        self._set_status("Batch finished" if results else "Batch failed", "#22c55e" if results and not counts["error"] else "#ef4444")
+        self.batch_results_box.delete("1.0", "end")
+        self.batch_results_box.insert("1.0", summary)
+        self.key_review_status_label.configure(
+            text=("Batch cancelled." if cancelled else "Batch finished.") + " See Dashboard for per-project results."
+        )
+        if not self._batch_document_projects:
+            self._load_batch_documents(results)
+        if self._batch_result_selection is None:
+            self.results_text.delete("1.0", "end")
+            self.results_text.insert("1.0", summary)
+            self.tabview.set("📈 Dashboard")
+        status = ("Batch failed" if not results else "Batch finished with errors" if counts["error"]
+                  else "Batch cancelled" if cancelled else "Batch finished")
+        color = "#ef4444" if counts["error"] or not results else "#f59e0b" if cancelled else "#22c55e"
+        self._pending_step_text = f"{status}. See the dashboard for project results."
+        self._pending_step_color = color
+        self._apply_pipeline_snapshot()
+        self._set_status(status, color)
         self._log_message(summary)
-        if results:
-            dialog = messagebox.showerror if counts["error"] else messagebox.showinfo
-            dialog("Multiple projects", summary, parent=self.root)
         
-    def _run_pipeline(self):
+    def _run_pipeline(self, treat_as_single: bool = False):
         """Run the bibliography management pipeline"""
         if self.processing:
             self._log_message("⚠️ The pipeline is already running.")
             return
 
+        self._pending_batch_projects = None
         directory = self.dir_entry.get().strip()
         
         if not directory:
@@ -4149,12 +4578,12 @@ class ModernBibGUI:
             messagebox.showerror("Source not found", f"The selected source does not exist:\n{directory}", parent=self.root)
             return
 
-        if Path(directory).is_dir():
+        if Path(directory).is_dir() and not treat_as_single:
             parent = Path(directory).resolve()
             try:
-                projects = discover_projects(parent)
+                projects = discover_batch_projects(parent)
                 if projects:
-                    projects = validate_project_roots(parent, projects)
+                    projects = validate_project_roots(parent, projects, allow_parent_with_children=True)
             except (OSError, UnicodeError, ValueError) as error:
                 diagnostic = _save_diagnostic(traceback.format_exc())
                 messagebox.showerror("Project discovery failed", f"{type(error).__name__}: {error}\n\n{diagnostic}", parent=self.root)
@@ -4166,11 +4595,15 @@ class ModernBibGUI:
                 if not self.push_var.get():
                     messagebox.showwarning("Multiple projects", "Enable 'Create processed copy' in advanced settings to process multiple projects.", parent=self.root)
                     return
-                self._start_batch(projects)
+                self._show_discovered_projects(projects)
                 return
             directory = str(projects[0])
 
         self._reset_tex_document_view("Processing project...")
+        self._batch_result_projects = {}
+        self._batch_result_selection = None
+        self.result_project_frame.grid_remove()
+        self.batch_results_frame.grid_remove()
         self._batch_outputs = []
         self._review_source = Path(directory).expanduser().resolve()
         self._batch_progress = None
@@ -4188,6 +4621,13 @@ class ModernBibGUI:
         self.report_path = None
         self._ui_call(self.view_report_btn.configure, state="disabled")
         self._key_review_items = []
+        self._batch_key_review_items = None
+        self._batch_review_active = False
+        self._batch_review_waiting = False
+        self.key_review_project_menu.grid_remove()
+        self.key_review_mark_btn.configure(state="disabled")
+        self.key_review_progress.grid_remove()
+        self.key_review_single_btn.grid_remove()
         self._key_review_event = None
         self._key_review_approved = False
         self._key_review_push_back = bool(self.push_var.get())
@@ -4205,10 +4645,11 @@ class ModernBibGUI:
         self.processing = True
         self._set_status("Running...", "#f59e0b")
 
-        # Minimize live UI churn while processing.
-        self._defer_log_render = True
+        # Batch log rendering while keeping the live pipeline visible.
+        self._defer_log_render = False
         with self._log_lock:
             self._deferred_logs.clear()
+        self.tabview.set("📋 Pipeline")
 
         # Capture UI-dependent options before entering worker thread.
         options = {
@@ -4361,10 +4802,10 @@ class ModernBibGUI:
 
             document_root = processed_directory or Path(working_directory)
             try:
-                self.manager.report_data["tex_documents"] = _collect_tex_documents(document_root)
+                self.manager.report_data["project_documents"] = _collect_project_documents(document_root, snapshot=zip_mode)
             except (OSError, UnicodeError) as error:
                 self.manager.report_data["tex_preview_error"] = (
-                    f"Could not load LaTeX document preview: {error}"
+                    f"Could not list project text files: {error}"
                 )
                 self._log_message(f"⚠️ {self.manager.report_data['tex_preview_error']}")
 
@@ -4410,27 +4851,13 @@ class ModernBibGUI:
                 self._ui_call(self.view_report_btn.configure, state="disabled")
                 self._log_message("⚠️ Report file not found at final path; View Report disabled.")
 
-            # Populate fixes tab if file changes recorded
-            file_changes = self.manager.report_data.get('file_changes', {})
-            if file_changes:
-                try:
-                    files = list(file_changes.keys())
-                    # Update option menu values on main thread
-                    def _update_values():
-                        self.fix_file_menu.configure(values=files)
-                        if files:
-                            self.fix_file_menu.set(files[0])
-                            self._show_file_fix(files[0])
-                    self.root.after(0, _update_values)
-                except Exception:
-                    pass
-            
-            
             # Update results
             self._ui_call(self._update_results)
             self._ui_call(self._load_tex_documents)
             self._ui_call(self._load_library_entries)
+            self._ui_call(self._load_fix_files)
             self._ui_call(self._complete_key_review, push_back)
+            self._ui_call(self.tabview.set, "📈 Dashboard")
             # Defer heavy duplicates rendering until user opens the Duplicates tab.
             self._pending_duplicates_refresh = True
             
@@ -4445,23 +4872,6 @@ class ModernBibGUI:
             self._log_message("="*60)
             self._set_status("Completed", "#22c55e")
 
-            # Show completion popup with output locations (on UI thread)
-            def _show_done_popup():
-                outputs = self._build_output_paths_text()
-                if outputs:
-                    msg = "Pipeline completed successfully!\n\n" + outputs + "\n\nCopy these paths to clipboard?"
-                    copy_now = messagebox.askyesno("BibTeX Manager", msg)
-                    if copy_now:
-                        ok = self._copy_output_paths_to_clipboard()
-                        if ok:
-                            messagebox.showinfo("BibTeX Manager", "Output paths copied to clipboard.")
-                        else:
-                            messagebox.showwarning("BibTeX Manager", "Could not copy to clipboard.")
-                else:
-                    messagebox.showinfo("BibTeX Manager", "Pipeline completed successfully!")
-
-            self._ui_call(_show_done_popup)
-            
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             diagnostic = _save_diagnostic(traceback.format_exc())
@@ -4583,7 +4993,7 @@ class ModernBibGUI:
         summary_lines.append("What changed")
         summary_lines.append("=" * 50)
         summary_lines.append("")
-        summary_lines.append(f"Scanned {data['files_found']} .bib file(s) across {scanned_folder_count} folder(s).")
+        summary_lines.append(f"Scanned {data['files_found']} bibliography source file(s) across {scanned_folder_count} folder(s).")
         summary_lines.append(
             f"Removed {data['duplicates_removed']} duplicate entries from {data['initial_entries']} initial entries, leaving {data['final_entries']} unique references."
         )
@@ -4592,6 +5002,11 @@ class ModernBibGUI:
             if data.get('tex_citation_updates', 0)
             else f"Normalized {len(data['keys_changed'])} citation key(s)."
         )
+        manual_count = sum(1 for entry in self.manager.all_entries if entry.get('_manual_bibitem'))
+        if manual_count:
+            summary_lines.append(
+                f"Preserved {manual_count} manual \\bibitem key(s); their unstructured references are not normalized."
+            )
         summary_lines.append(
             f"Changed {changed_file_count} file(s) across {len(changed_folder_counts)} folder(s): {bib_changed_count} .bib file(s) and {tex_changed_count} .tex file(s)."
         )
@@ -4602,18 +5017,19 @@ class ModernBibGUI:
         else:
             summary_lines.append("Only master.bib was created; source bibliography and LaTeX files were left unchanged.")
         summary_lines.append("")
-        summary_lines.append("Next step: inspect the most changed files below, then open Fixes for line-level diffs if something looks off.")
+        if changed_file_count:
+            summary_lines.append("Next step: inspect the most changed files below, then open Fixes for line-level diffs if something looks off.")
+        elif not data.get('push_back'):
+            summary_lines.append("No project files were written; a master bibliography was generated.")
+        else:
+            summary_lines.append("No changes were recorded in the project files; a master bibliography was still generated.")
 
         file_lines = []
         if sorted_file_changes:
             for path, payload in sorted_file_changes[:8]:
                 changed_lines = len(payload.get('changed_lines', []))
-                original_text = payload.get('original', '') or ''
-                updated_text = payload.get('updated', '') or ''
-                size_delta = len(updated_text) - len(original_text)
-                delta_prefix = "+" if size_delta >= 0 else ""
                 file_lines.append(f"{path}")
-                file_lines.append(f"  {changed_lines} changed line(s), {delta_prefix}{size_delta} chars")
+                file_lines.append(f"  {changed_lines} changed line(s)")
                 file_lines.append("")
         else:
             file_lines.append("No file-level changes were recorded.")
@@ -4712,13 +5128,22 @@ class ModernBibGUI:
         self._duplicate_groups_cache = groups
 
         if not groups:
-            self.dup_group_menu.configure(values=["No groups"])
+            self._duplicate_file_order = []
+            self._duplicate_highlight_positions = []
+            self.dup_group_menu.configure(values=["No groups"], state="disabled")
             self.dup_group_menu.set("No groups")
+            self.dup_file_menu.configure(values=["No files"], state="disabled")
+            self.dup_file_menu.set("No files")
+            self.dup_file_prev_btn.configure(state="disabled")
+            self.dup_file_next_btn.configure(state="disabled")
+            self.dup_file_label.configure(text="File: -")
             self.dup_prev_btn.configure(state="disabled")
             self.dup_next_btn.configure(state="disabled")
             self.dup_summary_label.configure(text="No duplicates found. Your bibliography is clean.")
             self.duplicates_text.delete("1.0", "end")
             self.duplicates_text.insert("1.0", "No duplicates found. Your bibliography is clean.\n")
+            for box in (self.dup_keep_box, self.dup_drop_box):
+                box.delete("1.0", "end")
             return
 
         labels = []
@@ -4727,7 +5152,7 @@ class ModernBibGUI:
             entries = group_data.get('entries', [])
             labels.append(f"Group {idx:03d} | {similarity}% | {len(entries)} entries")
 
-        self.dup_group_menu.configure(values=labels)
+        self.dup_group_menu.configure(values=labels, state="normal")
         self._selected_duplicate_group = min(self._selected_duplicate_group, len(groups) - 1)
         self.dup_group_menu.set(labels[self._selected_duplicate_group])
         self.dup_prev_btn.configure(state="normal")
@@ -4865,7 +5290,7 @@ class ModernBibGUI:
 
         if not file_order:
             self._duplicate_file_order = []
-            self.dup_file_menu.configure(values=["No files"])
+            self.dup_file_menu.configure(values=["No files"], state="disabled")
             self.dup_file_menu.set("No files")
             self.dup_file_prev_btn.configure(state="disabled")
             self.dup_file_next_btn.configure(state="disabled")
@@ -4881,7 +5306,7 @@ class ModernBibGUI:
             display_name = cached_source.get('relative_path', Path(src).name)
             self._duplicate_file_order.append(display_name)
 
-        self.dup_file_menu.configure(values=self._duplicate_file_order)
+        self.dup_file_menu.configure(values=self._duplicate_file_order, state="normal")
         self.dup_file_prev_btn.configure(state="normal" if len(self._duplicate_file_order) > 1 else "disabled")
         self.dup_file_next_btn.configure(state="normal" if len(self._duplicate_file_order) > 1 else "disabled")
         self._selected_duplicate_file = min(self._selected_duplicate_file, len(self._duplicate_file_order) - 1)
@@ -5032,6 +5457,20 @@ class ModernBibGUI:
             self._selected_duplicate_highlight = min(self._selected_duplicate_highlight, len(self._duplicate_highlight_positions) - 1)
             self._scroll_to_duplicate_highlight()
 
+    def _load_fix_files(self):
+        changes = self.manager.report_data.get("file_changes", {}) if self.manager else {}
+        files = sorted(changes)
+        self.fix_file_menu.configure(values=files or ["No changed files"], state="normal" if files else "disabled")
+        self.fix_file_menu.set(files[0] if files else "No changed files")
+        self.fixes_diff_text.delete("1.0", "end")
+        if files:
+            self._show_file_fix(files[0])
+        else:
+            self.fixes_diff_text.insert("1.0", "No file-level changes were recorded for this project.")
+            self.changed_info.configure(text="No changed files")
+            self.prev_change_btn.configure(state="disabled")
+            self.next_change_btn.configure(state="disabled")
+
     def _show_file_fix(self, selection: str):
         """Display IDE-style unified inline diff for selected changed file."""
         if not self.manager:
@@ -5048,8 +5487,30 @@ class ModernBibGUI:
             info = file_changes[sel]
             selection = sel
 
-        orig = info.get('original', '')
-        upd = info.get('updated', '')
+        orig = info.get('original')
+        upd = info.get('updated')
+        if orig is None or upd is None:
+            try:
+                output_path = self.manager.report_data.get("processed_copy_path")
+                if not output_path:
+                    raise ValueError("No processed project copy is available.")
+                original_path = Path(self.manager.root_directory) / selection
+                updated_path = Path(output_path) / selection
+                orig = original_path.read_text(encoding="utf-8")
+                upd = updated_path.read_text(encoding="utf-8")
+                for content, hash_key, label in ((orig, "original_hash", "Source"), (upd, "updated_hash", "Processed copy")):
+                    expected = info.get(hash_key)
+                    if expected and hashlib.sha256(content.encode("utf-8")).hexdigest() != expected:
+                        raise ValueError(f"{label} changed after processing; the recorded diff is no longer available.")
+            except (OSError, UnicodeError, ValueError) as error:
+                message = f"Could not load comparison for {selection}: {error}"
+                self.fixes_diff_text.delete("1.0", "end")
+                self.fixes_diff_text.insert("1.0", message)
+                self.changed_info.configure(text="Comparison unavailable")
+                self.prev_change_btn.configure(state="disabled")
+                self.next_change_btn.configure(state="disabled")
+                self._log_message(f"⚠️ {message}")
+                return
         changed = info.get('changed_lines', [])
 
         orig_lines = orig.splitlines()
@@ -5155,24 +5616,19 @@ class ModernBibGUI:
         """Open HTML report in browser"""
         if not (self.report_path and Path(self.report_path).exists()):
             self._log_message("❌ No report available")
+            messagebox.showwarning("Report unavailable", "No HTML report is available for this project.", parent=self.root)
             return
-
-        # Prefer an embedded native window using pywebview if available
+        report_uri = Path(self.report_path).resolve().as_uri()
         try:
-            webview = importlib.import_module('webview')
-
-            def _open_webview():
-                try:
-                    webview.create_window('BibTeX Report', f'file:///{self.report_path}', width=1000, height=800)
-                    webview.start()
-                except Exception:
-                    # If webview fails, fall back to system browser
-                    webbrowser.open(f"file:///{self.report_path}")
-
-            threading.Thread(target=_open_webview, daemon=True).start()
-        except Exception:
-            # Fallback: open in default system browser
-            webbrowser.open(f"file:///{self.report_path}")
+            opened = webbrowser.open(report_uri)
+        except (OSError, webbrowser.Error) as error:
+            self._log_message(f"❌ Could not open report: {error}")
+            messagebox.showerror("Could not open report", str(error), parent=self.root)
+            return
+        if not opened:
+            message = f"Could not open the report in a browser: {self.report_path}"
+            self._log_message(f"❌ {message}")
+            messagebox.showerror("Could not open report", message, parent=self.root)
             
     def run(self):
         """Start the GUI"""

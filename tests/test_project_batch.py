@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import bibtexparser
 
-from project_batch import discover_projects, process_projects, validate_project_roots
+from project_batch import RootFileProject, discover_batch_projects, discover_projects, process_projects, validate_project_roots
 
 
 class ProjectBatchTests(unittest.TestCase):
@@ -27,6 +27,18 @@ class ProjectBatchTests(unittest.TestCase):
         )
         return root
 
+    def test_empty_project_reports_skipped_analysis_stage(self):
+        project = self.root / "empty"
+        project.mkdir()
+        (project / "main.tex").write_text("No bibliography", encoding="utf-8")
+        stages = []
+        results = process_projects(
+            [project], 85, False, lambda _: True, lambda: False, lambda _: None,
+            lambda stage, *_: stages.append(stage),
+        )
+        self.assertEqual(results[0]["status"], "skipped")
+        self.assertIn("Analysis skipped", stages)
+
     def test_discovery_ignores_generated_folders_and_keeps_outermost_roots(self):
         first = self.make_project("first", "Smith", 2020)
         second = self.make_project("group/second", "Jones", 2021)
@@ -46,6 +58,112 @@ class ProjectBatchTests(unittest.TestCase):
         alias = Path(self.temporary.name)
         self.assertEqual(discover_projects(alias), [project])
         self.assertEqual(validate_project_roots(alias, [project]), [project])
+
+    def test_batch_keeps_root_sources_separate_from_nested_projects(self):
+        manual = self.root / "paper.tex"
+        manual.write_text(
+            "\\begin{thebibliography}{9}\n\\bibitem{same}Root reference.\n\\end{thebibliography}\n",
+            encoding="utf-8",
+        )
+        (self.root / "unrelated.txt").write_text("not project source", encoding="utf-8")
+        child = self.make_project("nested", "Smith", 2020)
+        other = self.make_project("other", "Jones", 2021)
+        projects = discover_batch_projects(self.root)
+        self.assertIsInstance(projects[0], RootFileProject)
+        self.assertEqual(projects[0].files, (manual,))
+        self.assertEqual(projects[1:], [child, other])
+        self.assertEqual(validate_project_roots(self.root, projects, allow_parent_with_children=True), projects)
+
+        def review(results):
+            self.assertEqual([item["status"] for item in results], ["ready"] * 3)
+            self.assertEqual([entry["ID"] for entry in results[0]["manager"].all_entries], ["same"])
+            return True
+
+        results = process_projects(projects, 85, False, review, lambda: False, lambda _: None)
+        self.assertEqual([result["status"] for result in results], ["success"] * 3)
+        root_output = results[0]["output"]
+        self.assertEqual((root_output / "paper.tex").read_text(encoding="utf-8"), manual.read_text(encoding="utf-8"))
+        self.assertFalse((root_output / "nested").exists())
+        self.assertFalse((root_output / "unrelated.txt").exists())
+        self.assertTrue((child / "processed" / "master.bib").exists())
+        self.assertTrue((other / "processed" / "master.bib").exists())
+
+    def test_nested_source_change_does_not_invalidate_root_only_review(self):
+        (self.root / "paper.tex").write_text(
+            "\\begin{thebibliography}{9}\n\\bibitem{same}Root.\n\\end{thebibliography}\n",
+            encoding="utf-8",
+        )
+        child = self.make_project("nested", "Smith", 2020)
+
+        def review(_results):
+            with (child / "refs.bib").open("a", encoding="utf-8") as source:
+                source.write("\n% edited after review\n")
+            return True
+
+        results = process_projects([self.root, child], 85, False, review, lambda: False, lambda _: None)
+        self.assertEqual([item["status"] for item in results], ["success", "error"])
+        self.assertIn("changed after review", results[1]["detail"])
+
+    def test_root_files_are_grouped_by_links_and_citations_not_comments(self):
+        files = {
+            "first.tex": "\\input{chapter}\n\\cite{one}\n% \\cite{two}\n",
+            "chapter.tex": "Chapter text.\n",
+            "one.bib": "@book{one,author={Smith},year={2020},title={One}}",
+            "second.tex": "\\addbibresource{two.bib}\n\\cite{two}\n",
+            "two.bib": "@book{two,author={Jones},year={2021},title={Two}}",
+            "unrelated.bib": "@book{other,author={Doe},year={2022},title={Other}}",
+        }
+        for name, content in files.items():
+            (self.root / name).write_text(content, encoding="utf-8")
+        projects = discover_batch_projects(self.root)
+        self.assertEqual(
+            {frozenset(path.name for path in project.files) for project in projects},
+            {frozenset({"first.tex", "chapter.tex", "one.bib"}),
+             frozenset({"second.tex", "two.bib"}), frozenset({"unrelated.bib"})},
+        )
+        validate_project_roots(self.root, projects, allow_parent_with_children=True)
+        results = process_projects(projects, 85, False, lambda _: True, lambda: False, lambda _: None)
+        self.assertEqual([result["status"] for result in results], ["success"] * 3)
+        for result in results:
+            output = result["output"]
+            names = {path.name for path in result["project"].files}
+            self.assertTrue(names <= {path.name for path in output.iterdir()})
+            self.assertFalse(any((output / name).exists() for name in set(files) - names - {"master.bib"}))
+        first_result = next(result for result in results if self.root / "first.tex" in result["project"].files)
+        self.assertIn("\\cite{S2020}", (first_result["output"] / "first.tex").read_text(encoding="utf-8"))
+        self.assertIn("% \\cite{two}", (first_result["output"] / "first.tex").read_text(encoding="utf-8"))
+
+    def test_changes_after_root_discovery_require_rediscovery(self):
+        (self.root / "one.bib").write_text("@book{one,title={One}}", encoding="utf-8")
+        (self.root / "two.bib").write_text("@book{two,title={Two}}", encoding="utf-8")
+        projects = discover_batch_projects(self.root)
+        (self.root / "one.bib").write_text("@book{changed,title={One}}", encoding="utf-8")
+        review = MagicMock()
+        results = process_projects(projects, 85, False, review, lambda: False, lambda _: None)
+        review.assert_not_called()
+        self.assertEqual([result["status"] for result in results], ["error", "error"])
+        self.assertIn("changed after discovery", results[0]["detail"])
+
+    def test_explicit_bibliography_links_without_citations_and_verbatim_are_handled(self):
+        (self.root / "paper.tex").write_text(
+            "\\bibliography{refs}\n\\addbibresource[location=local]{extra.bib}\n"
+            "\\begin{verbatim}\n\\cite{unrelated}\n\\end{verbatim}\n",
+            encoding="utf-8",
+        )
+        for name in ("refs", "extra", "unrelated"):
+            (self.root / f"{name}.bib").write_text(f"@book{{{name},title={{{name}}}}}", encoding="utf-8")
+        projects = discover_batch_projects(self.root)
+        self.assertEqual(
+            {frozenset(path.name for path in project.files) for project in projects},
+            {frozenset({"paper.tex", "refs.bib", "extra.bib"}), frozenset({"unrelated.bib"})},
+        )
+
+    def test_whole_folder_and_root_groups_cannot_overlap(self):
+        (self.root / "one.bib").write_text("@book{one,title={One}}", encoding="utf-8")
+        (self.root / "two.bib").write_text("@book{two,title={Two}}", encoding="utf-8")
+        projects = discover_batch_projects(self.root)
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            validate_project_roots(self.root, [self.root, *projects], allow_parent_with_children=True)
 
     def test_projects_with_same_keys_are_reviewed_and_written_independently(self):
         first = self.make_project("first", "Smith", 2020)
@@ -82,6 +200,98 @@ class ProjectBatchTests(unittest.TestCase):
         results = process_projects([first, second], 85, False, review, lambda: False, lambda _: None)
         self.assertEqual(reviews, [[(first, "ready"), (second, "ready")]])
         self.assertEqual([item["status"] for item in results], ["success", "success"])
+
+    def test_batch_reports_stages_and_exposes_first_copy_before_second(self):
+        first = self.make_project("first", "Smith", 2020)
+        second = self.make_project("second", "Jones", 2021)
+        events = []
+
+        def progress(stage, index, total, project, result):
+            events.append((stage, index, total, project))
+            if stage == "Project finished" and project == first:
+                self.assertEqual(result["status"], "success")
+                self.assertTrue((result["output"] / "main.tex").exists())
+                self.assertFalse((second / "processed").exists())
+
+        results = process_projects([first, second], 85, False, lambda _: True,
+                                   lambda: False, lambda _: None, progress)
+        self.assertIn(("Finding duplicates", 1, 2, first), events)
+        self.assertIn(("Normalizing citation keys", 2, 2, second), events)
+        self.assertLess(events.index(("Project finished", 1, 2, first)),
+                        events.index(("Creating processed copy", 2, 2, second)))
+        self.assertEqual([result["status"] for result in results], ["success", "success"])
+
+    def test_batch_status_keeps_long_project_names_out_of_global_status(self):
+        from bib_gui_modern import ModernBibGUI
+
+        gui = ModernBibGUI.__new__(ModernBibGUI)
+        gui.key_review_progress = MagicMock()
+        gui.key_review_status_label = MagicMock()
+        gui._set_status = MagicMock()
+        gui._apply_pipeline_snapshot = MagicMock()
+        gui._batch_document_projects = {}
+        name = "long_project_name_" * 8
+        gui._update_batch_progress("Creating processed copy", 1, 2, self.root / name, None)
+        gui._set_status.assert_called_once_with("Processing project 1 of 2", "#3b8ed0")
+        self.assertIn(name, gui.key_review_status_label.configure.call_args.kwargs["text"])
+
+    def test_completed_copy_is_published_while_next_copy_is_running(self):
+        from bib import BibliographyManager
+        from bib_gui_modern import ModernBibGUI
+
+        first = self.make_project("first", "Smith", 2020)
+        second = self.make_project("second", "Jones", 2021)
+        second_started = threading.Event()
+        release_second = threading.Event()
+        original_create = BibliographyManager.create_processed_copy
+        gui = ModernBibGUI.__new__(ModernBibGUI)
+        gui._batch_document_projects = {}
+        gui._batch_live_results = []
+        gui._batch_outputs = []
+        gui._batch_result_projects = {}
+        gui.step_cards = {}
+        gui._step_state = {}
+        gui._apply_pipeline_snapshot = MagicMock()
+        gui.key_review_progress = MagicMock()
+        gui.key_review_status_label = MagicMock()
+        gui.results_text = MagicMock()
+        gui.batch_results_box = MagicMock()
+        gui.result_project_menu = MagicMock()
+        gui.result_project_frame = MagicMock()
+        gui.tabview = MagicMock()
+        gui._select_batch_result = MagicMock()
+        gui._set_status = MagicMock()
+        gui._log_message = MagicMock()
+        gui._add_batch_document = MagicMock()
+
+        def create(manager):
+            if Path(manager.root_directory).resolve() == second:
+                second_started.set()
+                if not release_second.wait(10):
+                    raise TimeoutError("Second project was not released")
+            return original_create(manager)
+
+        results = []
+        def run():
+            results.extend(process_projects(
+                [first, second], 85, False, lambda _: True, lambda: False, lambda _: None,
+                gui._update_batch_progress,
+            ))
+
+        with patch.object(BibliographyManager, "create_processed_copy", create):
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(second_started.wait(10))
+                self.assertTrue(worker.is_alive())
+                self.assertEqual(gui._batch_live_results[0]["project"], first)
+                self.assertEqual(gui._batch_live_results[0]["status"], "success")
+                gui._add_batch_document.assert_called_once()
+            finally:
+                release_second.set()
+                worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([result["status"] for result in results], ["success", "success"])
 
     def test_large_duplicate_report_includes_all_entries_and_key_changes(self):
         from bib import BibliographyManager
@@ -185,6 +395,7 @@ class ProjectBatchTests(unittest.TestCase):
         finished = []
         gui._log_message = lambda _message: None
         gui._ui_call = lambda function, *args, **kwargs: function(*args, **kwargs)
+        gui._update_batch_progress = MagicMock()
 
         def approve(results):
             self.assertFalse((first / "processed").exists())
@@ -227,6 +438,7 @@ class ProjectBatchTests(unittest.TestCase):
         gui.root = object()
         gui._log_message = MagicMock()
         gui._show_batch_key_review = MagicMock(side_effect=RuntimeError("review failed"))
+        gui._update_batch_progress = MagicMock()
         gui._ui_call = lambda function, *args, **kwargs: function(*args, **kwargs)
         gui._finish_batch = MagicMock()
         with patch("bib_gui_modern._save_diagnostic", return_value="diagnostic location"), \
@@ -278,7 +490,7 @@ class ProjectBatchTests(unittest.TestCase):
         gui.dir_entry.root = self.root
         gui.push_var = type("Option", (), {"get": lambda self: True})()
         started = []
-        gui._start_batch = started.extend
+        gui._show_discovered_projects = started.extend
         gui._run_pipeline()
         self.assertEqual(started, [first, second])
 
@@ -301,7 +513,9 @@ class ProjectBatchTests(unittest.TestCase):
             "_reset_tex_document_view", "_log_message", "_set_status", "key_review_project_label",
             "key_review_path_label", "key_review_confirm_btn", "key_review_cancel_btn",
             "key_review_status_label", "key_review_tree", "key_review_count_label", "log_text",
-            "results_text", "view_report_btn", "run_btn", "cancel_btn",
+            "key_review_project_menu", "key_review_mark_btn", "key_review_progress", "key_review_single_btn",
+            "results_text", "view_report_btn", "run_btn", "cancel_btn", "result_project_frame",
+            "batch_results_frame", "tabview",
         ):
             setattr(gui, name, MagicMock())
         gui._ui_call = lambda function, *args, **kwargs: function(*args, **kwargs)
