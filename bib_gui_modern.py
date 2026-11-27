@@ -120,6 +120,7 @@ _DOCUMENT_TEXT_SUFFIXES = {
 
 def _collect_project_documents(root: Path, snapshot: bool = False) -> dict[str, Path | bytes]:
     """List supported text files, excluding generated subfolders."""
+    root = root.resolve()
     documents = {}
 
     def scan_error(error: OSError) -> None:
